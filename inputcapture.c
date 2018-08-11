@@ -2,11 +2,6 @@
   input capture driver
 */
 
-
-/*
- * General Info
- */
-
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -17,6 +12,8 @@
 #include <linux/uaccess.h>
 #include <linux/device.h>
 #include <linux/interrupt.h>
+#include <linux/gpio.h>
+
 
 #define DRIVER_AUTHOR "23ars <ardeleanasm@gmail.com>"
 #define DRIVER_DESC "Input Capture driver"
@@ -47,8 +44,8 @@
 #define _IOCTL_MAGIC 'K'
 #define IOCICDEVGPIORP _IOW(_IOCTL_MAGIC,1,u16) /* register pin */
 #define IOCICDEVGPIOUP _IOW(_IOCTL_MAGIC,2,u16) /* unregister ping */
-#define IOCICDEVGPIOEN _IO(IOCTL_MAGIC,3)       /* start */
-#define IOCICDEVGPIODS _IO(IOCTL_MAGIC,4)       /* stop  */
+#define IOCICDEVGPIOEN _IO(_IOCTL_MAGIC,3)       /* start */
+#define IOCICDEVGPIODS _IO(_IOCTL_MAGIC,4)       /* stop  */
 
 struct ic_device {
   struct cdev cdev;
@@ -61,16 +58,16 @@ struct ic_device {
 static struct ic_device *icdev_Ptr=NULL;
 static dev_t icdev_no;
 static struct class *icdev_class_Ptr=NULL;
-
-static u16 gpio_no;
+static u32 ioctl_read_value;
 static u32 icdev_value;
 static int icdev_open(struct inode *, struct file *);
 static int icdev_release(struct inode *, struct file *);
 static ssize_t icdev_read(struct file *, char __user *, size_t, loff_t *);
 static long icdev_ioctl(struct file *, unsigned int, unsigned long);
+volatile bool start_measuring=false;
+volatile int icdev_irq_no=-1;
 
-
-static irq_handler_t irq_input_handler(int, void *, struct pt_regs *);
+static irq_handler_t icdev_irq_handler(int, void *, struct pt_regs *);
 
 struct file_operations fops=
   {
@@ -93,10 +90,6 @@ static int icdev_open(struct inode *inode, struct file *file)
     return -EBUSY;
   }
 
-  /*
-   * TODO:gpio & interrupt initialization
-   */
-
   icdev_Ptr->is_open = 1;
   mutex_unlock(&icdev_Ptr->io_mutex);
   
@@ -109,11 +102,6 @@ static int icdev_release(struct inode *inode, struct file *file)
 {
 
   mutex_lock(&icdev_Ptr->io_mutex);
-  /*
-   * TODO: gpio & interrupt clean
-   */ 
-
-
   icdev_Ptr->is_open=0;
   mutex_unlock(&icdev_Ptr->io_mutex);
   
@@ -138,11 +126,62 @@ static ssize_t icdev_read(struct file *filp, char __user *buffer, size_t length,
 
 static long icdev_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioctl_param)
 {
+  u16 __user *ioctl_value_Ptr;
+  long error_code;
+  ioctl_read_value=0x00ul;
+  if (mutex_trylock(&icdev_Ptr->io_mutex) == 0) {
+    printk(KERN_ERR "Device Busy!\n");
+    return -EBUSY;
+  }
+
+  ioctl_value_Ptr = (u16 __user *)ioctl_param;
+  if (copy_from_user(&ioctl_read_value,ioctl_value_Ptr,sizeof(u16)) != 0) {
+    return -EINVAL;
+  }
+
+  switch(ioctl_num){
+  case IOCICDEVGPIORP:/* register pin */
+    if (gpio_is_valid(ioctl_read_value)) {
+      gpio_request(ioctl_read_value,"sysfs");/*Check if error -> !=0*/
+      gpio_direction_input(ioctl_read_value);
+      gpio_export(ioctl_read_value,false);
+      /*request interrupt*/
+      icdev_irq_no=gpio_to_irq(ioctl_read_value);
+      if (request_irq(icdev_irq_no,(irq_handler_t)icdev_irq_handler,
+		      IRQF_TRIGGER_RISING|IRQF_TRIGGER_FALLING,
+		      DEVICE_NAME,
+		      (void *)ioctl_read_value)){
+	icdev_irq_no=-1; 
+      } else {
+	// TODO: Set Error code
+      }
+    } else {
+      // TODO: Set Error code
+    }
+    
+    break;
+  case IOCICDEVGPIOUP:/* unregister pin */
+    if (icdev_irq_no != -1) {
+      free_irq(icdev_irq_no, NULL);
+    }
+    gpio_unexport(ioctl_read_value);
+    gpio_free(ioctl_read_value);
+    break;
+  case IOCICDEVGPIOEN:/* start */
+    start_measuring = true;
+    break;
+  case IOCICDEVGPIODS:/*stop measuring*/
+    start_measuring = false;
+    break;
+  default:
+    break;
+  }
+  mutex_unlock(&icdev_Ptr->io_mutex);
   return 0L;
 }
 
 
-static irq_handler_t irq_input_handler(int irq, void *dev_id, struct pt_regs *regs)
+static irq_handler_t icdev_irq_handler(int irq, void *dev_id, struct pt_regs *regs)
 {
   return (irq_handler_t) IRQ_HANDLED;
 }
