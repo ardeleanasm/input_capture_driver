@@ -43,6 +43,13 @@
   device_destroy(icdev_class_Ptr,MKDEV(MAJOR(icdev_no),0));	\
   cdev_del(&(icdev_Ptr->cdev))
 
+
+#define _IOCTL_MAGIC 'K'
+#define IOCICDEVGPIORP _IOW(_IOCTL_MAGIC,1,u16) /* register pin */
+#define IOCICDEVGPIOUP _IOW(_IOCTL_MAGIC,2,u16) /* unregister ping */
+#define IOCICDEVGPIOEN _IO(IOCTL_MAGIC,3)       /* start */
+#define IOCICDEVGPIODS _IO(IOCTL_MAGIC,4)       /* stop  */
+
 struct ic_device {
   struct cdev cdev;
   struct device *device_Ptr;
@@ -51,14 +58,17 @@ struct ic_device {
 };
 
 
-
 static struct ic_device *icdev_Ptr=NULL;
 static dev_t icdev_no;
 static struct class *icdev_class_Ptr=NULL;
 
+static u16 gpio_no;
+static u32 icdev_value;
 static int icdev_open(struct inode *, struct file *);
 static int icdev_release(struct inode *, struct file *);
 static ssize_t icdev_read(struct file *, char __user *, size_t, loff_t *);
+static long icdev_ioctl(struct file *, unsigned int, unsigned long);
+
 
 static irq_handler_t irq_input_handler(int, void *, struct pt_regs *);
 
@@ -66,27 +76,73 @@ struct file_operations fops=
   {
     .open=icdev_open,
     .release=icdev_release,
-    .read=icdev_read
+    .read=icdev_read,
+    .unlocked_ioctl=icdev_ioctl
   };
 
 
 static int icdev_open(struct inode *inode, struct file *file)
 {
+  if (mutex_trylock(&icdev_Ptr->io_mutex) == 0) {
+    printk(KERN_ERR "Device Busy!\n");
+    return -EBUSY;
+  }
+
+  if (icdev_Ptr->is_open == 1) {
+    printk(KERN_ERR "%s:Device already open!\n",DEVICE_NAME);
+    return -EBUSY;
+  }
+
+  /*
+   * TODO:gpio & interrupt initialization
+   */
+
+  icdev_Ptr->is_open = 1;
+  mutex_unlock(&icdev_Ptr->io_mutex);
+  
+  
   return 0;
 }
 
 
 static int icdev_release(struct inode *inode, struct file *file)
 {
+
+  mutex_lock(&icdev_Ptr->io_mutex);
+  /*
+   * TODO: gpio & interrupt clean
+   */ 
+
+
+  icdev_Ptr->is_open=0;
+  mutex_unlock(&icdev_Ptr->io_mutex);
+  
   return 0;
 }
 
 static ssize_t icdev_read(struct file *filp, char __user *buffer, size_t length, loff_t *offset)
 {
-  return 0;
+  if (mutex_trylock(&icdev_Ptr->io_mutex) == 0) {
+    printk(KERN_ERR "Device Busy!\n");
+    return -EBUSY;
+  }
+  icdev_value=0xAAULL;/*TODO: Remove with actual calculation*/
+  if (copy_to_user(buffer,&icdev_value,sizeof(u32)) != 0) {
+    mutex_unlock(&icdev_Ptr->io_mutex);
+    return -EINVAL;
+  }
+
+  mutex_unlock(&icdev_Ptr->io_mutex);
+  return sizeof(u32);
 }
 
-static irq_handler_t irq_event_handler(int irq, void *dev_id, struct pt_regs *regs)
+static long icdev_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioctl_param)
+{
+  return 0L;
+}
+
+
+static irq_handler_t irq_input_handler(int irq, void *dev_id, struct pt_regs *regs)
 {
   return (irq_handler_t) IRQ_HANDLED;
 }
