@@ -13,7 +13,7 @@
 #include <linux/device.h>
 #include <linux/interrupt.h>
 #include <linux/gpio.h>
-
+#include <linux/timex.h>
 
 #define DRIVER_AUTHOR "23ars <ardeleanasm@gmail.com>"
 #define DRIVER_DESC "Input Capture driver"
@@ -26,17 +26,17 @@
 #define VERSION_PATCH_NUMBER 0x00u
 
 
-#define FREE_DEVICE() \
+#define icdev_free_device() \
   kfree(icdev_Ptr);	   \
   icdev_Ptr = NULL
 
-#define UNREGISTER_REGION() unregister_chrdev_region(icdev_no,1)
+#define icdev_unregister_region() unregister_chrdev_region(icdev_no,1)
 
-#define DESTROY_CLASS() \
+#define icdev_destroy_class() \
   class_destroy(icdev_class_Ptr);		\
   icdev_class_Ptr = NULL
 
-#define DESTROY_DEVICE() \
+#define icdev_destroy_device() \
   device_destroy(icdev_class_Ptr,MKDEV(MAJOR(icdev_no),0));	\
   cdev_del(&(icdev_Ptr->cdev))
 
@@ -54,20 +54,30 @@ struct ic_device {
   u8 is_open;
 };
 
+enum icdev_event_type {
+  EVENT_NONE=0x00,
+  EVENT_RISING,
+  EVENT_FALLING
+};
+
 
 static struct ic_device *icdev_Ptr=NULL;
 static dev_t icdev_no;
 static struct class *icdev_class_Ptr=NULL;
-static u32 ioctl_read_value;
-static u32 icdev_value;
+static u16 ioctl_read_value;
+
+volatile bool start_measuring=false;
+volatile int icdev_irq_no=-1;
+volatile u64 icdev_value_ev_rising=0x00ull;
+volatile u64 icdev_value_ev_falling=0x00ull;
+
 static int icdev_open(struct inode *, struct file *);
 static int icdev_release(struct inode *, struct file *);
 static ssize_t icdev_read(struct file *, char __user *, size_t, loff_t *);
 static long icdev_ioctl(struct file *, unsigned int, unsigned long);
-volatile bool start_measuring=false;
-volatile int icdev_irq_no=-1;
-
 static irq_handler_t icdev_irq_handler(int, void *, struct pt_regs *);
+
+static void calculate_period(u64 *);
 
 struct file_operations fops=
   {
@@ -76,6 +86,12 @@ struct file_operations fops=
     .read=icdev_read,
     .unlocked_ioctl=icdev_ioctl
   };
+
+
+static void calculate_period(u64 *read_value)
+{
+  *read_value=icdev_value_ev_falling-icdev_value_ev_rising;
+}
 
 
 static int icdev_open(struct inode *inode, struct file *file)
@@ -110,11 +126,12 @@ static int icdev_release(struct inode *inode, struct file *file)
 
 static ssize_t icdev_read(struct file *filp, char __user *buffer, size_t length, loff_t *offset)
 {
+  u64 icdev_value;
   if (mutex_trylock(&icdev_Ptr->io_mutex) == 0) {
     printk(KERN_ERR "Device Busy!\n");
     return -EBUSY;
   }
-  icdev_value=0xAAULL;/*TODO: Remove with actual calculation*/
+  calculate_period(&icdev_value);
   if (copy_to_user(buffer,&icdev_value,sizeof(u32)) != 0) {
     mutex_unlock(&icdev_Ptr->io_mutex);
     return -EINVAL;
@@ -142,7 +159,7 @@ static long icdev_ioctl(struct file *file, unsigned int ioctl_num, unsigned long
   switch(ioctl_num){
   case IOCICDEVGPIORP:/* register pin */
     if (gpio_is_valid(ioctl_read_value)) {
-      gpio_request(ioctl_read_value,"sysfs");/*Check if error -> !=0*/
+      gpio_request(ioctl_read_value,"sysfs");/*TODO: Check if error -> !=0*/
       gpio_direction_input(ioctl_read_value);
       gpio_export(ioctl_read_value,false);
       /*request interrupt*/
@@ -183,6 +200,29 @@ static long icdev_ioctl(struct file *file, unsigned int ioctl_num, unsigned long
 
 static irq_handler_t icdev_irq_handler(int irq, void *dev_id, struct pt_regs *regs)
 {
+  static enum icdev_event_type event_type=EVENT_NONE;
+  if (mutex_trylock(&icdev_Ptr->io_mutex) == 0) {
+    printk(KERN_ERR "Device Busy!\n");
+    return (irq_handler_t) IRQ_NONE;
+  }
+  if (start_measuring) {
+    switch (event_type){
+    case EVENT_NONE:
+      event_type=EVENT_RISING;
+      icdev_value_ev_rising=get_cycles();
+      break;
+    case EVENT_RISING:
+      event_type=EVENT_FALLING;
+      icdev_value_ev_falling=get_cycles();
+      break;
+    case EVENT_FALLING:
+      event_type=EVENT_NONE;
+      break;
+    default:
+      break;
+    }
+  }
+  mutex_unlock(&icdev_Ptr->io_mutex);
   return (irq_handler_t) IRQ_HANDLED;
 }
 
@@ -192,7 +232,7 @@ static irq_handler_t icdev_irq_handler(int irq, void *dev_id, struct pt_regs *re
 
 static s8 alloc_device(void)
 {
-  icdev_Ptr=kmalloc(sizeof(struct ic_device),GFP_KERNEL);
+  icdev_Ptr=kmalloc(sizeof(*icdev_Ptr),GFP_KERNEL);
   if (icdev_Ptr == NULL) {
     printk(KERN_WARNING "%s:Failed to alloc memory for ic_device\n",DEVICE_NAME);
     return -1;
@@ -200,7 +240,7 @@ static s8 alloc_device(void)
   memset(icdev_Ptr,0,sizeof(struct ic_device));
   if (alloc_chrdev_region(&icdev_no,0,1,DEVICE_NAME) < 0) {
     printk(KERN_WARNING "%s:Could not register\n",DEVICE_NAME);
-    FREE_DEVICE();
+    icdev_free_device();
     return -1;
   }
   return 0;
@@ -212,8 +252,8 @@ static s8 init_class(void)
   icdev_class_Ptr=class_create(THIS_MODULE,DEVICE_CLASS_NAME);
   if (IS_ERR(icdev_class_Ptr)) {
     printk(KERN_WARNING "%s:Could not create class\n",DEVICE_NAME);
-    UNREGISTER_REGION();
-    FREE_DEVICE();
+    icdev_unregister_region();
+    icdev_free_device();
     return -1;
   }
   return 0;
@@ -225,19 +265,19 @@ static s8 init_device_registration(void)
   icdev_Ptr->cdev.owner = THIS_MODULE;
   if (cdev_add(&(icdev_Ptr->cdev),icdev_no,1) != 0) {
     printk(KERN_WARNING "%s:Could not add device\n",DEVICE_NAME);
-    DESTROY_CLASS();
-    UNREGISTER_REGION();
-    FREE_DEVICE();
+    icdev_destroy_class();
+    icdev_unregister_region();
+    icdev_free_device();
     return -1;
   }
 
   icdev_Ptr->device_Ptr = device_create(icdev_class_Ptr,NULL,MKDEV(MAJOR(icdev_no),0),NULL,DEVICE_PROCESS,0);
   if (IS_ERR(icdev_Ptr->device_Ptr)) {
     printk(KERN_WARNING "%s:Could not create device\n",DEVICE_NAME);
-    DESTROY_DEVICE();
-    DESTROY_CLASS();
-    UNREGISTER_REGION();
-    FREE_DEVICE();
+    icdev_destroy_device();
+    icdev_destroy_class();
+    icdev_unregister_region();
+    icdev_free_device();
     return -1;
   }
   return 0;
@@ -279,12 +319,12 @@ static void __exit ic_exit(void)
 {
   printk(KERN_INFO "%s:Unregister...:(",DEVICE_NAME);
   if (icdev_Ptr != NULL) {
-    DESTROY_DEVICE();
-    FREE_DEVICE();
+    icdev_destroy_device();
+    icdev_free_device();
   }
   unregister_chrdev_region(icdev_no,1);
   if (icdev_class_Ptr != NULL) {
-    DESTROY_CLASS();
+    icdev_destroy_class();
   }
   printk(KERN_INFO "Driver %s unloaded.",DEVICE_NAME);
   
