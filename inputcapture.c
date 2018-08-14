@@ -54,11 +54,6 @@ struct ic_device {
   u8 is_open;
 };
 
-enum icdev_event_type {
-  EVENT_NONE=0x00,
-  EVENT_RISING,
-  EVENT_FALLING
-};
 
 
 static struct ic_device *icdev_Ptr=NULL;
@@ -68,8 +63,8 @@ static u16 ioctl_read_value;
 
 volatile bool start_measuring=false;
 volatile int icdev_irq_no=-1;
-volatile u64 icdev_value_ev_rising=0x00ull;
-volatile u64 icdev_value_ev_falling=0x00ull;
+volatile u64 icdev_value_ev=0x00ull;
+
 
 static int icdev_open(struct inode *, struct file *);
 static int icdev_release(struct inode *, struct file *);
@@ -77,7 +72,9 @@ static ssize_t icdev_read(struct file *, char __user *, size_t, loff_t *);
 static long icdev_ioctl(struct file *, unsigned int, unsigned long);
 static irq_handler_t icdev_irq_handler(int, void *, struct pt_regs *);
 
-static void calculate_period(u64 *);
+
+
+static DEFINE_RWLOCK(event_rwlock);
 
 struct file_operations fops=
   {
@@ -86,12 +83,6 @@ struct file_operations fops=
     .read=icdev_read,
     .unlocked_ioctl=icdev_ioctl
   };
-
-
-static void calculate_period(u64 *read_value)
-{
-  *read_value=icdev_value_ev_falling-icdev_value_ev_rising;
-}
 
 
 static int icdev_open(struct inode *inode, struct file *file)
@@ -103,6 +94,7 @@ static int icdev_open(struct inode *inode, struct file *file)
 
   if (icdev_Ptr->is_open == 1) {
     printk(KERN_ERR "%s:Device already open!\n",DEVICE_NAME);
+    mutex_unlock(&icdev_Ptr->io_mutex);
     return -EBUSY;
   }
 
@@ -116,8 +108,8 @@ static int icdev_open(struct inode *inode, struct file *file)
 
 static int icdev_release(struct inode *inode, struct file *file)
 {
-
-  mutex_lock(&icdev_Ptr->io_mutex);
+  if (mutex_is_locked(&icdev_Ptr->io_mutex) == 0)
+    mutex_lock(&icdev_Ptr->io_mutex);
   icdev_Ptr->is_open=0;
   mutex_unlock(&icdev_Ptr->io_mutex);
   
@@ -126,19 +118,18 @@ static int icdev_release(struct inode *inode, struct file *file)
 
 static ssize_t icdev_read(struct file *filp, char __user *buffer, size_t length, loff_t *offset)
 {
-  u64 icdev_value;
-  if (mutex_trylock(&icdev_Ptr->io_mutex) == 0) {
-    printk(KERN_ERR "Device Busy!\n");
-    return -EBUSY;
-  }
-  calculate_period(&icdev_value);
-  if (copy_to_user(buffer,&icdev_value,sizeof(u32)) != 0) {
-    mutex_unlock(&icdev_Ptr->io_mutex);
+  
+  unsigned long flags;
+  u64 buffer_value=0x00ull;
+
+  read_lock_irqsave(&event_rwlock, flags);
+  buffer_value=icdev_value_ev;
+  read_unlock_irqrestore(&event_rwlock, flags);
+  
+  if (copy_to_user(buffer,&buffer_value,sizeof(u64)) != 0) {
     return -EINVAL;
   }
-
-  mutex_unlock(&icdev_Ptr->io_mutex);
-  return sizeof(u32);
+  return sizeof(u64);
 }
 
 static long icdev_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioctl_param)
@@ -146,10 +137,6 @@ static long icdev_ioctl(struct file *file, unsigned int ioctl_num, unsigned long
   u16 __user *ioctl_value_Ptr;
   long error_code;
   ioctl_read_value=0x00ul;
-  if (mutex_trylock(&icdev_Ptr->io_mutex) == 0) {
-    printk(KERN_ERR "Device Busy!\n");
-    return -EBUSY;
-  }
 
   ioctl_value_Ptr = (u16 __user *)ioctl_param;
   if (copy_from_user(&ioctl_read_value,ioctl_value_Ptr,sizeof(u16)) != 0) {
@@ -193,36 +180,25 @@ static long icdev_ioctl(struct file *file, unsigned int ioctl_num, unsigned long
   default:
     break;
   }
-  mutex_unlock(&icdev_Ptr->io_mutex);
   return 0L;
 }
 
 
 static irq_handler_t icdev_irq_handler(int irq, void *dev_id, struct pt_regs *regs)
 {
-  static enum icdev_event_type event_type=EVENT_NONE;
-  if (mutex_trylock(&icdev_Ptr->io_mutex) == 0) {
-    printk(KERN_ERR "Device Busy!\n");
-    return (irq_handler_t) IRQ_NONE;
+
+  unsigned long flags;
+  int value = 0x00;
+  write_lock_irqsave(&event_rwlock, flags);
+  value = gpio_get_value(ioctl_read_value);
+  if (value > 0 ) {
+    icdev_value_ev = get_cycles();
+  } else {
+    icdev_value_ev = get_cycles()-icdev_value_ev; 
   }
-  if (start_measuring) {
-    switch (event_type){
-    case EVENT_NONE:
-      event_type=EVENT_RISING;
-      icdev_value_ev_rising=get_cycles();
-      break;
-    case EVENT_RISING:
-      event_type=EVENT_FALLING;
-      icdev_value_ev_falling=get_cycles();
-      break;
-    case EVENT_FALLING:
-      event_type=EVENT_NONE;
-      break;
-    default:
-      break;
-    }
-  }
-  mutex_unlock(&icdev_Ptr->io_mutex);
+
+  write_unlock_irqrestore(&event_rwlock, flags);
+
   return (irq_handler_t) IRQ_HANDLED;
 }
 
