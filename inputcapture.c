@@ -13,7 +13,13 @@
 #include <linux/device.h>
 #include <linux/interrupt.h>
 #include <linux/gpio.h>
+#ifdef ARM_ARM_ARM
 #include <linux/timex.h>
+#else
+#include <linux/jiffies.h>
+#include <linux/param.h>
+#include <asm/div64.h>
+#endif
 
 #define DRIVER_AUTHOR "23ars <ardeleanasm@gmail.com>"
 #define DRIVER_DESC "Input Capture driver"
@@ -123,9 +129,13 @@ static ssize_t icdev_read(struct file *filp, char __user *buffer, size_t length,
   u64 buffer_value=0x00ull;
 
   read_lock_irqsave(&event_rwlock, flags);
+#ifdef ARM_ARM_ARM  
   buffer_value=icdev_value_ev;
+#else
+  buffer_value=icdev_value_ev*1000;
+  buffer_value=do_div(buffer_value,HZ);
+#endif  
   read_unlock_irqrestore(&event_rwlock, flags);
-  
   if (copy_to_user(buffer,&buffer_value,sizeof(u64)) != 0) {
     return -EINVAL;
   }
@@ -145,6 +155,7 @@ static long icdev_ioctl(struct file *file, unsigned int ioctl_num, unsigned long
 
   switch(ioctl_num){
   case IOCICDEVGPIORP:/* register pin */
+    pr_err("\tIOCICDEVGPIORP:Gpio Pin %d",ioctl_read_value);
     if (gpio_is_valid(ioctl_read_value)) {
       gpio_request(ioctl_read_value,"sysfs");/*TODO: Check if error -> !=0*/
       gpio_direction_input(ioctl_read_value);
@@ -191,10 +202,21 @@ static irq_handler_t icdev_irq_handler(int irq, void *dev_id, struct pt_regs *re
   int value = 0x00;
   write_lock_irqsave(&event_rwlock, flags);
   value = gpio_get_value(ioctl_read_value);
+  pr_err("\tInterrupt:Read Value %d", value);
   if (value > 0 ) {
-    icdev_value_ev = get_cycles();
+    #ifdef ARM_ARM_ARM
+      icdev_value_ev = get_cycles();
+    #else
+      icdev_value_ev=get_jiffies_64();
+    #endif
+    pr_err("\tInterrupt:Get Cycles Rising %d", icdev_value_ev);
   } else {
+    #ifdef ARM_ARM_ARM
     icdev_value_ev = get_cycles()-icdev_value_ev; 
+    #else
+      icdev_value_ev = get_jiffies_64()-icdev_value_ev; 
+    #endif
+    pr_err("\tInterrupt:Get Cycles Falling %d", icdev_value_ev);
   }
 
   write_unlock_irqrestore(&event_rwlock, flags);
@@ -315,4 +337,4 @@ MODULE_DESCRIPTION(DRIVER_DESC);
 MODULE_SUPPORTED_DEVICE("device")
 
 module_init(ic_init);
-module_exit(ic_exit);
+module_exit(ic_exit); 
