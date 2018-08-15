@@ -133,12 +133,7 @@ static ssize_t icdev_read(struct file *filp, char __user *buffer, size_t length,
   u64 buffer_value=0x00ull;
 
   read_lock_irqsave(&event_rwlock, flags);
-#ifdef ARM_ARM_ARM  
   buffer_value=icdev_value_ev;
-#else
-  buffer_value=icdev_value_ev*1000;
-  buffer_value=do_div(buffer_value,HZ);
-#endif  
   read_unlock_irqrestore(&event_rwlock, flags);
   if (copy_to_user(buffer,&buffer_value,sizeof(u64)) != 0) {
     return -EINVAL;
