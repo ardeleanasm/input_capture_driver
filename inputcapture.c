@@ -51,6 +51,9 @@
 #define IOCICDEVGPIOEN _IO(_IOCTL_MAGIC,3)       /* start */
 #define IOCICDEVGPIODS _IO(_IOCTL_MAGIC,4)       /* stop  */
 
+#define EVENT_NONE 0x00u
+#define EVENT_DONE 0x01u
+
 struct ic_device {
   struct cdev cdev;
   struct device *device_Ptr;
@@ -68,6 +71,8 @@ static u16 ioctl_read_value;
 volatile bool start_measuring=false;
 volatile int icdev_irq_no=-1;
 volatile u64 icdev_value_ev=0x00ull;
+volatile u8 read_event_rising=EVENT_NONE;
+volatile u8 read_event_falling=EVENT_NONE;
 
 
 static int icdev_open(struct inode *, struct file *);
@@ -101,7 +106,8 @@ static int icdev_open(struct inode *inode, struct file *file)
     mutex_unlock(&icdev_Ptr->io_mutex);
     return -EBUSY;
   }
-
+  read_event_rising=EVENT_NONE;
+  read_event_falling=EVENT_NONE;
   icdev_Ptr->is_open = 1;
   mutex_unlock(&icdev_Ptr->io_mutex);
   
@@ -201,27 +207,32 @@ static irq_handler_t icdev_irq_handler(int irq, void *dev_id, struct pt_regs *re
   struct timespec64 t;
 #endif
   int value = 0x00;
-  write_lock_irqsave(&event_rwlock, flags);
-  value = gpio_get_value(ioctl_read_value);
-  pr_err("\tInterrupt:Read Value %d", value);
-  if (value > 0 ) {
-#ifndef ARM_CPU
-    icdev_value_ev = get_cycles(); /* get_cycles return clock counter value except for arm and 486*/
-#else
-    ktime_get_real_ts64(&t); /*alias getnstimeofday is deprecated for new code*/
-    icdev_value_ev=t.tv_sec*1000000000ull+t.tv_nsec;/*transform everything to nsec*/
-#endif
-    pr_err("\tInterrupt:Get Cycles Rising %llu", icdev_value_ev);
-  } else {
-#ifndef ARM_CPU
-    icdev_value_ev = get_cycles()-icdev_value_ev; 
-#else
-    ktime_get_real_ts64(&t);
-    icdev_value_ev = t.tv_sec*1000000000ull+t.tv_nsec-icdev_value_ev; 
-#endif
-    pr_err("\tInterrupt:Get Cycles Falling %llu", icdev_value_ev);
-  }
 
+  write_lock_irqsave(&event_rwlock, flags);
+  if ( !read_event_rising || !read_event_falling){
+    value = gpio_get_value(ioctl_read_value);
+    pr_err("\tInterrupt:Read Value %d", value);
+    if (value > 0 && !read_event_rising ) {
+#ifndef ARM_CPU
+      icdev_value_ev = get_cycles(); /* get_cycles return clock counter value except for arm and 486*/
+#else
+      ktime_get_real_ts64(&t); /*alias getnstimeofday is deprecated for new code*/
+      icdev_value_ev=t.tv_sec*1000000000ull+t.tv_nsec;/*transform everything to nsec*/
+#endif
+      pr_err("\tInterrupt:Get Cycles Rising %llu", icdev_value_ev);
+      read_event_rising = EVENT_DONE;
+    } else if ( value <1 && !read_event_falling) {
+#ifndef ARM_CPU
+      icdev_value_ev = get_cycles()-icdev_value_ev; 
+#else
+      ktime_get_real_ts64(&t);
+      icdev_value_ev = t.tv_sec*1000000000ull+t.tv_nsec-icdev_value_ev; 
+#endif
+      pr_err("\tInterrupt:Get Cycles Falling %llu", icdev_value_ev);
+      read_event_falling = EVENT_DONE;
+    }
+    
+  }
   write_unlock_irqrestore(&event_rwlock, flags);
 
   return (irq_handler_t) IRQ_HANDLED;
