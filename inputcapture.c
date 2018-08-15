@@ -13,12 +13,10 @@
 #include <linux/device.h>
 #include <linux/interrupt.h>
 #include <linux/gpio.h>
-#ifdef ARM_ARM_ARM
+#ifndef ARM_CPU /*if is not running on ARM CPU then is ok to use get_cycles*/
 #include <linux/timex.h>
 #else
-#include <linux/jiffies.h>
-#include <linux/param.h>
-#include <asm/div64.h>
+#include <linux/ktime.h> /*make use of getnstimeofday()*/
 #endif
 
 #define DRIVER_AUTHOR "23ars <ardeleanasm@gmail.com>"
@@ -199,24 +197,29 @@ static irq_handler_t icdev_irq_handler(int irq, void *dev_id, struct pt_regs *re
 {
 
   unsigned long flags;
+#ifdef ARM_CPU
+  struct timespec64 t;
+#endif
   int value = 0x00;
   write_lock_irqsave(&event_rwlock, flags);
   value = gpio_get_value(ioctl_read_value);
   pr_err("\tInterrupt:Read Value %d", value);
   if (value > 0 ) {
-    #ifdef ARM_ARM_ARM
-      icdev_value_ev = get_cycles();
-    #else
-      icdev_value_ev=get_jiffies_64();
-    #endif
-    pr_err("\tInterrupt:Get Cycles Rising %d", icdev_value_ev);
+#ifndef ARM_CPU
+    icdev_value_ev = get_cycles(); /* get_cycles return clock counter value except for arm and 486*/
+#else
+    ktime_get_real_ts64(&t); /*alias getnstimeofday is deprecated for new code*/
+    icdev_value_ev=t.tv_sec*1000000000ull+t.tv_nsec;/*transform everything to nsec*/
+#endif
+    pr_err("\tInterrupt:Get Cycles Rising %llu", icdev_value_ev);
   } else {
-    #ifdef ARM_ARM_ARM
+#ifndef ARM_CPU
     icdev_value_ev = get_cycles()-icdev_value_ev; 
-    #else
-      icdev_value_ev = get_jiffies_64()-icdev_value_ev; 
-    #endif
-    pr_err("\tInterrupt:Get Cycles Falling %d", icdev_value_ev);
+#else
+    ktime_get_real_ts64(&t);
+    icdev_value_ev = t.tv_sec*1000000000ull+t.tv_nsec-icdev_value_ev; 
+#endif
+    pr_err("\tInterrupt:Get Cycles Falling %llu", icdev_value_ev);
   }
 
   write_unlock_irqrestore(&event_rwlock, flags);
