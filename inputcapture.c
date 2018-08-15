@@ -316,18 +316,20 @@ static int __init ic_init(void)
 static void __exit ic_exit(void)
 {
   printk(KERN_INFO "%s:Unregister...:(",DEVICE_NAME);
-  if (icdev_Ptr != NULL) {
-    icdev_destroy_device();
-    icdev_free_device();
-  }
-  unregister_chrdev_region(icdev_no,1);
+
   if (icdev_class_Ptr != NULL) {
+    icdev_destroy_device();
     icdev_destroy_class();
   }
+
+  icdev_unregister_region();
+  
+  if (icdev_Ptr != NULL) {
+    icdev_free_device();
+  }
+
   printk(KERN_INFO "Driver %s unloaded.",DEVICE_NAME);
-  
-  
-  
+ 
 }
 
 
