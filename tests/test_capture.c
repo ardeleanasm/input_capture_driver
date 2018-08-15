@@ -40,7 +40,7 @@ int main(int argc, char **argv)
     goto error;
   }
 
-  while(1)
+  while(i<10)
   {
     sleep(1);
     printf("Sleep...%d \n",i);
