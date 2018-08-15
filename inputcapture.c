@@ -13,7 +13,11 @@
 #include <linux/device.h>
 #include <linux/interrupt.h>
 #include <linux/gpio.h>
+#ifndef ARM_CPU /*if is not running on ARM CPU then is ok to use get_cycles*/
 #include <linux/timex.h>
+#else
+#include <linux/ktime.h> /*make use of getnstimeofday()*/
+#endif
 
 #define DRIVER_AUTHOR "23ars <ardeleanasm@gmail.com>"
 #define DRIVER_DESC "Input Capture driver"
@@ -123,9 +127,13 @@ static ssize_t icdev_read(struct file *filp, char __user *buffer, size_t length,
   u64 buffer_value=0x00ull;
 
   read_lock_irqsave(&event_rwlock, flags);
+#ifdef ARM_ARM_ARM  
   buffer_value=icdev_value_ev;
+#else
+  buffer_value=icdev_value_ev*1000;
+  buffer_value=do_div(buffer_value,HZ);
+#endif  
   read_unlock_irqrestore(&event_rwlock, flags);
-  
   if (copy_to_user(buffer,&buffer_value,sizeof(u64)) != 0) {
     return -EINVAL;
   }
@@ -145,6 +153,7 @@ static long icdev_ioctl(struct file *file, unsigned int ioctl_num, unsigned long
 
   switch(ioctl_num){
   case IOCICDEVGPIORP:/* register pin */
+    pr_err("\tIOCICDEVGPIORP:Gpio Pin %d",ioctl_read_value);
     if (gpio_is_valid(ioctl_read_value)) {
       gpio_request(ioctl_read_value,"sysfs");/*TODO: Check if error -> !=0*/
       gpio_direction_input(ioctl_read_value);
@@ -188,13 +197,29 @@ static irq_handler_t icdev_irq_handler(int irq, void *dev_id, struct pt_regs *re
 {
 
   unsigned long flags;
+#ifdef ARM_CPU
+  struct timespec64 t;
+#endif
   int value = 0x00;
   write_lock_irqsave(&event_rwlock, flags);
   value = gpio_get_value(ioctl_read_value);
+  pr_err("\tInterrupt:Read Value %d", value);
   if (value > 0 ) {
-    icdev_value_ev = get_cycles();
+#ifndef ARM_CPU
+    icdev_value_ev = get_cycles(); /* get_cycles return clock counter value except for arm and 486*/
+#else
+    ktime_get_real_ts64(&t); /*alias getnstimeofday is deprecated for new code*/
+    icdev_value_ev=t.tv_sec*1000000000ull+t.tv_nsec;/*transform everything to nsec*/
+#endif
+    pr_err("\tInterrupt:Get Cycles Rising %llu", icdev_value_ev);
   } else {
+#ifndef ARM_CPU
     icdev_value_ev = get_cycles()-icdev_value_ev; 
+#else
+    ktime_get_real_ts64(&t);
+    icdev_value_ev = t.tv_sec*1000000000ull+t.tv_nsec-icdev_value_ev; 
+#endif
+    pr_err("\tInterrupt:Get Cycles Falling %llu", icdev_value_ev);
   }
 
   write_unlock_irqrestore(&event_rwlock, flags);
@@ -294,18 +319,20 @@ static int __init ic_init(void)
 static void __exit ic_exit(void)
 {
   printk(KERN_INFO "%s:Unregister...:(",DEVICE_NAME);
-  if (icdev_Ptr != NULL) {
-    icdev_destroy_device();
-    icdev_free_device();
-  }
-  unregister_chrdev_region(icdev_no,1);
+
   if (icdev_class_Ptr != NULL) {
+    icdev_destroy_device();
     icdev_destroy_class();
   }
+
+  icdev_unregister_region();
+  
+  if (icdev_Ptr != NULL) {
+    icdev_free_device();
+  }
+
   printk(KERN_INFO "Driver %s unloaded.",DEVICE_NAME);
-  
-  
-  
+ 
 }
 
 
@@ -315,4 +342,4 @@ MODULE_DESCRIPTION(DRIVER_DESC);
 MODULE_SUPPORTED_DEVICE("device")
 
 module_init(ic_init);
-module_exit(ic_exit);
+module_exit(ic_exit); 
