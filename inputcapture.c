@@ -231,10 +231,10 @@ static irq_handler_t icdev_irq_handler(int irq, void *dev_id)
   icdev_value_ev=t.tv_sec*1000000000ull+t.tv_nsec;/*transform everything to nsec*/
 #endif
   
-  if (value>0 && icdev_detect_level != ICDEV_DETECT_FALLING_EDGES) {
+  if (value == 1 && icdev_detect_level != ICDEV_DETECT_FALLING_EDGES) {
     pr_devel("Value greated than 0, timer value %llu",icdev_value_ev);
     wake_up_interruptible(&icdev_waitq);
-  } else if (value<1 && icdev_detect_level != ICDEV_DETECT_RISING_EDGES){
+  } else if (value == 0 && icdev_detect_level != ICDEV_DETECT_RISING_EDGES){
     pr_devel("Value greated than 0, timer value %llu",icdev_value_ev);
     wake_up_interruptible(&icdev_waitq);
   } else {
