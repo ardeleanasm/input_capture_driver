@@ -55,7 +55,7 @@ int main(int argc, char **argv)
     FD_ZERO(&read_fd);
     FD_SET(fd, &read_fd);
 
-    val = select(fd, &read_fd, NULL, NULL, NULL);
+    val = select(fd+1, &read_fd, NULL, NULL, NULL);
     /* From this line, the process has been notified already */
     if (val == -1) {
       fprintf(stderr, "Select error %s", strerror(errno));

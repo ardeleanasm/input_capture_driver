@@ -77,7 +77,7 @@ static u8 icdev_detect_level=0x00u;
 
 volatile u64 icdev_value_ev=0x00ull;
 volatile int icdev_irq_no=-1;
-
+volatile bool icdev_data_available=false;
 
 
 
@@ -88,7 +88,7 @@ static int icdev_release(struct inode *, struct file *);
 static ssize_t icdev_read(struct file *, char __user *, size_t, loff_t *);
 static unsigned int icdev_poll(struct file *, poll_table *);
 static long icdev_ioctl(struct file *, unsigned int, unsigned long);
-static irq_handler_t icdev_irq_handler(int, void *, struct pt_regs *);
+static irq_handler_t icdev_irq_handler(int, void *);
 
 static DEFINE_RWLOCK(event_rwlock);
 static DECLARE_WAIT_QUEUE_HEAD(icdev_waitq);
@@ -115,6 +115,7 @@ static int icdev_open(struct inode *inode, struct file *file)
     mutex_unlock(&icdev_Ptr->io_mutex);
     return -EBUSY;
   }
+  icdev_data_available = false;
   icdev_Ptr->is_open = 1;
   mutex_unlock(&icdev_Ptr->io_mutex);
   
@@ -128,6 +129,7 @@ static int icdev_release(struct inode *inode, struct file *file)
   if (!mutex_is_locked(&icdev_Ptr->io_mutex))
     mutex_lock(&icdev_Ptr->io_mutex);
   icdev_Ptr->is_open=0;
+  icdev_data_available = false;
   mutex_unlock(&icdev_Ptr->io_mutex);
   
   return 0;
@@ -157,17 +159,21 @@ static unsigned int icdev_poll(struct file *file, poll_table *wait)
   unsigned int reval_mask=0x00u;
   poll_wait(file,&icdev_waitq,wait);
   read_lock_irqsave(&event_rwlock,flags);
-  if (icdev_value_ev == 0ull) {
+  if (icdev_data_available == true) {
     reval_mask|=(POLLIN | POLLRDNORM);
   }
   read_unlock_irqrestore(&event_rwlock,flags);
+  /*reset flag*/
+  write_lock_irqsave(&event_rwlock,flags);
+  icdev_data_available = false;
+  write_unlock_irqrestore(&event_rwlock,flags);
   return reval_mask;
 }
 
 static long icdev_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioctl_param)
 {
   u16 __user *ioctl_value_Ptr;
-  long error_code;
+  long error_code=0x00L;
   ioctl_read_value=0x00ul;
 
   ioctl_value_Ptr = (u16 __user *)ioctl_param;
@@ -184,16 +190,13 @@ static long icdev_ioctl(struct file *file, unsigned int ioctl_num, unsigned long
       gpio_export(ioctl_read_value,false);
       /*request interrupt*/
       icdev_irq_no=gpio_to_irq(ioctl_read_value);
-      if (request_irq(icdev_irq_no,(irq_handler_t)icdev_irq_handler,
-		      IRQF_TRIGGER_RISING|IRQF_TRIGGER_FALLING,
-		      DEVICE_NAME,
-		      (void *)ioctl_read_value)){
-	icdev_irq_no=-1; 
-      } else {
-	// TODO: Set Error code
-      }
+      if (request_irq(icdev_irq_no,(irq_handler_t)icdev_irq_handler, IRQF_TRIGGER_RISING|IRQF_TRIGGER_FALLING,
+		      DEVICE_NAME, NULL)){
+	icdev_irq_no=-1;
+	pr_err("Request irq error");
+      } 
     } else {
-      // TODO: Set Error code
+      pr_err("INVALID GPIO");
     }
     break;
   case IOCICDW:/* unregister pin */
@@ -215,13 +218,13 @@ static long icdev_ioctl(struct file *file, unsigned int ioctl_num, unsigned long
   default:
     break;
   }
-  return 0L;
+  return error_code;
 }
 
 
 
 
-static irq_handler_t icdev_irq_handler(int irq, void *dev_id, struct pt_regs *regs)
+static irq_handler_t icdev_irq_handler(int irq, void *dev_id)
 {
 
 #ifdef ARM_CPU
@@ -231,7 +234,7 @@ static irq_handler_t icdev_irq_handler(int irq, void *dev_id, struct pt_regs *re
   write_lock(&event_rwlock);
   icdev_value_ev=0x00ull;
   value = gpio_get_value(ioctl_read_value);
-  pr_devel("\tInterrupt:Read Value %d", value);
+  pr_err("\tInterrupt:Read Value %d", value);
 
 #ifndef ARM_CPU
   icdev_value_ev = get_cycles(); /* get_cycles return clock counter value except for arm and 486*/
@@ -242,11 +245,13 @@ static irq_handler_t icdev_irq_handler(int irq, void *dev_id, struct pt_regs *re
   
   if (value>0 && icdev_detect_level != ICDEV_DETECT_FALLING_EDGES) {
     pr_devel("Value greated than 0, timer value %llu",icdev_value_ev);
+    icdev_data_available = true;
     wake_up_interruptible(&icdev_waitq);
   }
 
   if (value<1 && icdev_detect_level != ICDEV_DETECT_RISING_EDGES){
     pr_devel("Value greated than 0, timer value %llu",icdev_value_ev);
+    icdev_data_available = true;
     wake_up_interruptible(&icdev_waitq);
   }
   write_unlock(&event_rwlock);
