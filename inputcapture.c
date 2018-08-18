@@ -27,7 +27,7 @@
 
 #define VERSION_MAJOR_NUMBER 0x01u
 #define VERSION_MINOR_NUMBER 0x00u
-#define VERSION_PATCH_NUMBER 0x00u
+#define VERSION_PATCH_NUMBER 0x01u
 
 
 #define icdev_free_device() \
@@ -80,11 +80,13 @@ static int icdev_release(struct inode *, struct file *);
 static ssize_t icdev_read(struct file *, char __user *, size_t, loff_t *);
 static long icdev_ioctl(struct file *, unsigned int, unsigned long);
 static irq_handler_t icdev_irq_handler(int, void *, struct pt_regs *);
-
+static void tasklet_handler(unsigned long data);
 
 
 static DEFINE_RWLOCK(event_rwlock);
+static DECLARE_TASKLET_DISABLED(irq_tasklet_worker,tasklet_handler,0);
 
+				
 struct file_operations fops=
   {
     .open=icdev_open,
@@ -109,6 +111,7 @@ static int icdev_open(struct inode *inode, struct file *file)
   read_event_rising=EVENT_NONE;
   read_event_falling=EVENT_NONE;
   icdev_Ptr->is_open = 1;
+  tasklet_enable(&irq_tasklet_worker);
   mutex_unlock(&icdev_Ptr->io_mutex);
   
   
@@ -121,6 +124,7 @@ static int icdev_release(struct inode *inode, struct file *file)
   if (!mutex_is_locked(&icdev_Ptr->io_mutex))
     mutex_lock(&icdev_Ptr->io_mutex);
   icdev_Ptr->is_open=0;
+  tasklet_kill(&irq_tasklet_worker);
   mutex_unlock(&icdev_Ptr->io_mutex);
   
   return 0;
@@ -129,12 +133,12 @@ static int icdev_release(struct inode *inode, struct file *file)
 static ssize_t icdev_read(struct file *filp, char __user *buffer, size_t length, loff_t *offset)
 {
   
-  unsigned long flags;
+  //  unsigned long flags;
   u64 buffer_value=0x00ull;
 
-  read_lock_irqsave(&event_rwlock, flags);
+  read_lock(&event_rwlock);
   buffer_value=icdev_value_ev;
-  read_unlock_irqrestore(&event_rwlock, flags);
+  read_unlock(&event_rwlock);
   if (copy_to_user(buffer,&buffer_value,sizeof(u64)) != 0) {
     return -EINVAL;
   }
@@ -194,14 +198,12 @@ static long icdev_ioctl(struct file *file, unsigned int ioctl_num, unsigned long
 }
 
 
-static irq_handler_t icdev_irq_handler(int irq, void *dev_id, struct pt_regs *regs)
+static void tasklet_handler(unsigned long data)
 {
-
-#ifdef ARM_CPU
+  #ifdef ARM_CPU
   struct timespec64 t;
 #endif
   int value = 0x00;
-
   write_lock(&event_rwlock);
   if ( !read_event_rising || !read_event_falling){
     value = gpio_get_value(ioctl_read_value);
@@ -229,6 +231,14 @@ static irq_handler_t icdev_irq_handler(int irq, void *dev_id, struct pt_regs *re
   }
   write_unlock(&event_rwlock);
 
+}
+
+
+
+static irq_handler_t icdev_irq_handler(int irq, void *dev_id, struct pt_regs *regs)
+{
+
+  tasklet_schedule(&irq_tasklet_worker);
   return (irq_handler_t) IRQ_HANDLED;
 }
 
