@@ -118,7 +118,7 @@ static int icdev_open(struct inode *inode, struct file *file)
 
 static int icdev_release(struct inode *inode, struct file *file)
 {
-  if (mutex_is_locked(&icdev_Ptr->io_mutex) == 0)
+  if (!mutex_is_locked(&icdev_Ptr->io_mutex))
     mutex_lock(&icdev_Ptr->io_mutex);
   icdev_Ptr->is_open=0;
   mutex_unlock(&icdev_Ptr->io_mutex);
@@ -197,13 +197,12 @@ static long icdev_ioctl(struct file *file, unsigned int ioctl_num, unsigned long
 static irq_handler_t icdev_irq_handler(int irq, void *dev_id, struct pt_regs *regs)
 {
 
-  unsigned long flags;
 #ifdef ARM_CPU
   struct timespec64 t;
 #endif
   int value = 0x00;
 
-  write_lock_irqsave(&event_rwlock, flags);
+  write_lock(&event_rwlock);
   if ( !read_event_rising || !read_event_falling){
     value = gpio_get_value(ioctl_read_value);
     pr_err("\tInterrupt:Read Value %d", value);
@@ -228,7 +227,7 @@ static irq_handler_t icdev_irq_handler(int irq, void *dev_id, struct pt_regs *re
     }
     
   }
-  write_unlock_irqrestore(&event_rwlock, flags);
+  write_unlock(&event_rwlock);
 
   return (irq_handler_t) IRQ_HANDLED;
 }
