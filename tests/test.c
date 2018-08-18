@@ -41,7 +41,7 @@ int main(int argc, char **argv)
     return -1;
   }
 
-  if(ioctl(fd,IOCICRE)!=0){
+  if(ioctl(fd,IOCICRE,&gpio_number)!=0){
     fprintf(stderr,"IOCICRE(Rising Edge):%s\n",strerror(errno));
     goto error;
   }

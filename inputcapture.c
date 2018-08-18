@@ -93,7 +93,6 @@ static void tasklet_handler(unsigned long data);
 
 
 static DEFINE_RWLOCK(event_rwlock);
-static DECLARE_TASKLET_DISABLED(irq_tasklet_worker,tasklet_handler,0);
 static DECLARE_WAIT_QUEUE_HEAD(icdev_waitq);
 				
 struct file_operations fops=
@@ -119,7 +118,6 @@ static int icdev_open(struct inode *inode, struct file *file)
     return -EBUSY;
   }
   icdev_Ptr->is_open = 1;
-  tasklet_enable(&irq_tasklet_worker);
   mutex_unlock(&icdev_Ptr->io_mutex);
   
   
@@ -132,7 +130,6 @@ static int icdev_release(struct inode *inode, struct file *file)
   if (!mutex_is_locked(&icdev_Ptr->io_mutex))
     mutex_lock(&icdev_Ptr->io_mutex);
   icdev_Ptr->is_open=0;
-  tasklet_kill(&irq_tasklet_worker);
   mutex_unlock(&icdev_Ptr->io_mutex);
   
   return 0;
@@ -141,12 +138,13 @@ static int icdev_release(struct inode *inode, struct file *file)
 static ssize_t icdev_read(struct file *filp, char __user *buffer, size_t length, loff_t *offset)
 {
   
-  //  unsigned long flags;
+  unsigned long flags;
   u64 buffer_value=0x00ull;
 
-  read_lock(&event_rwlock);
+  read_lock_irqsave(&event_rwlock, flags);
   buffer_value=icdev_value_ev;
-  read_unlock(&event_rwlock);
+  read_unlock_irqrestore(&event_rwlock, flags);
+
   if (copy_to_user(buffer,&buffer_value,sizeof(u64)) != 0) {
     return -EINVAL;
   }
@@ -157,14 +155,14 @@ static ssize_t icdev_read(struct file *filp, char __user *buffer, size_t length,
 
 static unsigned int icdev_poll(struct file *file, poll_table *wait)
 {
-  //icdev_waitq
+  unsigned long flags;
   unsigned int reval_mask=0x00u;
   poll_wait(file,&icdev_waitq,wait);
-  read_lock(&event_rwlock);
+  read_lock_irqsave(&event_rwlock,flags);
   if (icdev_value_ev == 0ull) {
     reval_mask|=(POLLIN | POLLRDNORM);
   }
-  read_unlock(&event_rwlock);
+  read_unlock_irqrestore(&event_rwlock,flags);
   return reval_mask;
 }
 
@@ -223,9 +221,10 @@ static long icdev_ioctl(struct file *file, unsigned int ioctl_num, unsigned long
 }
 
 
-static void tasklet_handler(unsigned long data)
-{
 
+
+static irq_handler_t icdev_irq_handler(int irq, void *dev_id, struct pt_regs *regs)
+{
 
 #ifdef ARM_CPU
   struct timespec64 t;
@@ -253,16 +252,6 @@ static void tasklet_handler(unsigned long data)
     wake_up_interruptible(&icdev_waitq);
   }
   write_unlock(&event_rwlock);
-  
-  
-}
-
-
-
-static irq_handler_t icdev_irq_handler(int irq, void *dev_id, struct pt_regs *regs)
-{
-
-  tasklet_schedule(&irq_tasklet_worker);
   return (irq_handler_t) IRQ_HANDLED;
 }
 
