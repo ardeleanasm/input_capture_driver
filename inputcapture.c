@@ -13,6 +13,7 @@
 #include <linux/device.h>
 #include <linux/interrupt.h>
 #include <linux/gpio.h>
+#include <linux/poll.h>
 #ifndef ARM_CPU /*if is not running on ARM CPU then is ok to use get_cycles*/
 #include <linux/timex.h>
 #else
@@ -27,7 +28,7 @@
 
 #define VERSION_MAJOR_NUMBER 0x01u
 #define VERSION_MINOR_NUMBER 0x00u
-#define VERSION_PATCH_NUMBER 0x00u
+#define VERSION_PATCH_NUMBER 0x01u
 
 
 #define icdev_free_device() \
@@ -46,13 +47,18 @@
 
 
 #define _IOCTL_MAGIC 'K'
-#define IOCICDEVGPIORP _IOW(_IOCTL_MAGIC,1,u16) /* register pin */
-#define IOCICDEVGPIOUP _IOW(_IOCTL_MAGIC,2,u16) /* unregister ping */
-#define IOCICDEVGPIOEN _IO(_IOCTL_MAGIC,3)       /* start */
-#define IOCICDEVGPIODS _IO(_IOCTL_MAGIC,4)       /* stop  */
+#define IOCICUP _IOW(_IOCTL_MAGIC,1,u16) /* register pin */
+#define IOCICDW _IOW(_IOCTL_MAGIC,2,u16) /* unregister ping */
+#define IOCICFE _IO(_IOCTL_MAGIC,3) /*Capture timer value on every falling edge*/
+#define IOCICRE _IO(_IOCTL_MAGIC,4) /*Capture timer value on every rising edge*/
+#define IOCICRF _IO(_IOCTL_MAGIC,5) /*Capture timer value on rising and falling*/
 
-#define EVENT_NONE 0x00u
-#define EVENT_DONE 0x01u
+
+#define ICDEV_DETECT_RISING_EDGES 0x01u
+#define ICDEV_DETECT_FALLING_EDGES 0x02u
+#define ICDEV_DETECT_BOTH_EDGES 0x03u
+
+
 
 struct ic_device {
   struct cdev cdev;
@@ -67,29 +73,32 @@ static struct ic_device *icdev_Ptr=NULL;
 static dev_t icdev_no;
 static struct class *icdev_class_Ptr=NULL;
 static u16 ioctl_read_value;
+static u8 icdev_detect_level=0x00u;
 
-volatile bool start_measuring=false;
-volatile int icdev_irq_no=-1;
 volatile u64 icdev_value_ev=0x00ull;
-volatile u8 read_event_rising=EVENT_NONE;
-volatile u8 read_event_falling=EVENT_NONE;
+volatile int icdev_irq_no=-1;
+volatile bool icdev_data_available=false;
+
+
+
 
 
 static int icdev_open(struct inode *, struct file *);
 static int icdev_release(struct inode *, struct file *);
 static ssize_t icdev_read(struct file *, char __user *, size_t, loff_t *);
+static unsigned int icdev_poll(struct file *, poll_table *);
 static long icdev_ioctl(struct file *, unsigned int, unsigned long);
-static irq_handler_t icdev_irq_handler(int, void *, struct pt_regs *);
-
-
+static irq_handler_t icdev_irq_handler(int, void *);
 
 static DEFINE_RWLOCK(event_rwlock);
-
+static DECLARE_WAIT_QUEUE_HEAD(icdev_waitq);
+				
 struct file_operations fops=
   {
     .open=icdev_open,
     .release=icdev_release,
     .read=icdev_read,
+    .poll=icdev_poll,
     .unlocked_ioctl=icdev_ioctl
   };
 
@@ -106,8 +115,7 @@ static int icdev_open(struct inode *inode, struct file *file)
     mutex_unlock(&icdev_Ptr->io_mutex);
     return -EBUSY;
   }
-  read_event_rising=EVENT_NONE;
-  read_event_falling=EVENT_NONE;
+  icdev_data_available = false;
   icdev_Ptr->is_open = 1;
   mutex_unlock(&icdev_Ptr->io_mutex);
   
@@ -121,6 +129,7 @@ static int icdev_release(struct inode *inode, struct file *file)
   if (!mutex_is_locked(&icdev_Ptr->io_mutex))
     mutex_lock(&icdev_Ptr->io_mutex);
   icdev_Ptr->is_open=0;
+  icdev_data_available = false;
   mutex_unlock(&icdev_Ptr->io_mutex);
   
   return 0;
@@ -135,16 +144,36 @@ static ssize_t icdev_read(struct file *filp, char __user *buffer, size_t length,
   read_lock_irqsave(&event_rwlock, flags);
   buffer_value=icdev_value_ev;
   read_unlock_irqrestore(&event_rwlock, flags);
+
   if (copy_to_user(buffer,&buffer_value,sizeof(u64)) != 0) {
     return -EINVAL;
   }
+  if (buffer_value == 0)
+    return 0;
   return sizeof(u64);
+}
+
+static unsigned int icdev_poll(struct file *file, poll_table *wait)
+{
+  unsigned long flags;
+  unsigned int reval_mask=0x00u;
+  poll_wait(file,&icdev_waitq,wait);
+  read_lock_irqsave(&event_rwlock,flags);
+  if (icdev_data_available == true) {
+    reval_mask|=(POLLIN | POLLRDNORM);
+  }
+  read_unlock_irqrestore(&event_rwlock,flags);
+  /*reset flag*/
+  write_lock_irqsave(&event_rwlock,flags);
+  icdev_data_available = false;
+  write_unlock_irqrestore(&event_rwlock,flags);
+  return reval_mask;
 }
 
 static long icdev_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioctl_param)
 {
   u16 __user *ioctl_value_Ptr;
-  long error_code;
+  long error_code=0x00L;
   ioctl_read_value=0x00ul;
 
   ioctl_value_Ptr = (u16 __user *)ioctl_param;
@@ -153,82 +182,79 @@ static long icdev_ioctl(struct file *file, unsigned int ioctl_num, unsigned long
   }
 
   switch(ioctl_num){
-  case IOCICDEVGPIORP:/* register pin */
-    pr_err("\tIOCICDEVGPIORP:Gpio Pin %d",ioctl_read_value);
+  case IOCICUP:/* register pin */
+    pr_err("\tIOCICUP:Gpio Pin %d",ioctl_read_value);
     if (gpio_is_valid(ioctl_read_value)) {
       gpio_request(ioctl_read_value,"sysfs");/*TODO: Check if error -> !=0*/
       gpio_direction_input(ioctl_read_value);
       gpio_export(ioctl_read_value,false);
       /*request interrupt*/
       icdev_irq_no=gpio_to_irq(ioctl_read_value);
-      if (request_irq(icdev_irq_no,(irq_handler_t)icdev_irq_handler,
-		      IRQF_TRIGGER_RISING|IRQF_TRIGGER_FALLING,
-		      DEVICE_NAME,
-		      (void *)ioctl_read_value)){
-	icdev_irq_no=-1; 
-      } else {
-	// TODO: Set Error code
-      }
+      if (request_irq(icdev_irq_no,(irq_handler_t)icdev_irq_handler, IRQF_TRIGGER_RISING|IRQF_TRIGGER_FALLING,
+		      DEVICE_NAME, NULL)){
+	icdev_irq_no=-1;
+	pr_err("Request irq error");
+      } 
     } else {
-      // TODO: Set Error code
+      pr_err("INVALID GPIO");
     }
-    
     break;
-  case IOCICDEVGPIOUP:/* unregister pin */
+  case IOCICDW:/* unregister pin */
     if (icdev_irq_no != -1) {
       free_irq(icdev_irq_no, NULL);
     }
     gpio_unexport(ioctl_read_value);
     gpio_free(ioctl_read_value);
     break;
-  case IOCICDEVGPIOEN:/* start */
-    start_measuring = true;
+  case IOCICFE: /*Capture timer value on every falling edge*/
+    icdev_detect_level=ICDEV_DETECT_FALLING_EDGES;
     break;
-  case IOCICDEVGPIODS:/*stop measuring*/
-    start_measuring = false;
+  case IOCICRE: /*Capture timer value on every rising edge*/
+    icdev_detect_level=ICDEV_DETECT_RISING_EDGES;
+    break;
+  case IOCICRF:
+    icdev_detect_level=ICDEV_DETECT_BOTH_EDGES;
     break;
   default:
     break;
   }
-  return 0L;
+  return error_code;
 }
 
 
-static irq_handler_t icdev_irq_handler(int irq, void *dev_id, struct pt_regs *regs)
+
+
+static irq_handler_t icdev_irq_handler(int irq, void *dev_id)
 {
 
 #ifdef ARM_CPU
   struct timespec64 t;
 #endif
   int value = 0x00;
-
   write_lock(&event_rwlock);
-  if ( !read_event_rising || !read_event_falling){
-    value = gpio_get_value(ioctl_read_value);
-    pr_err("\tInterrupt:Read Value %d", value);
-    if (value > 0 && !read_event_rising ) {
+  icdev_value_ev=0x00ull;
+  value = gpio_get_value(ioctl_read_value);
+  pr_err("\tInterrupt:Read Value %d", value);
+
 #ifndef ARM_CPU
-      icdev_value_ev = get_cycles(); /* get_cycles return clock counter value except for arm and 486*/
+  icdev_value_ev = get_cycles(); /* get_cycles return clock counter value except for arm and 486*/
 #else
-      ktime_get_real_ts64(&t); /*alias getnstimeofday is deprecated for new code*/
-      icdev_value_ev=t.tv_sec*1000000000ull+t.tv_nsec;/*transform everything to nsec*/
+  ktime_get_real_ts64(&t); /*alias getnstimeofday is deprecated for new code*/
+  icdev_value_ev=t.tv_sec*1000000000ull+t.tv_nsec;/*transform everything to nsec*/
 #endif
-      pr_err("\tInterrupt:Get Cycles Rising %llu", icdev_value_ev);
-      read_event_rising = EVENT_DONE;
-    } else if ( value <1 && !read_event_falling) {
-#ifndef ARM_CPU
-      icdev_value_ev = get_cycles()-icdev_value_ev; 
-#else
-      ktime_get_real_ts64(&t);
-      icdev_value_ev = t.tv_sec*1000000000ull+t.tv_nsec-icdev_value_ev; 
-#endif
-      pr_err("\tInterrupt:Get Cycles Falling %llu", icdev_value_ev);
-      read_event_falling = EVENT_DONE;
-    }
-    
+  
+  if (value>0 && icdev_detect_level != ICDEV_DETECT_FALLING_EDGES) {
+    pr_devel("Value greated than 0, timer value %llu",icdev_value_ev);
+    icdev_data_available = true;
+    wake_up_interruptible(&icdev_waitq);
+  }
+
+  if (value<1 && icdev_detect_level != ICDEV_DETECT_RISING_EDGES){
+    pr_devel("Value greated than 0, timer value %llu",icdev_value_ev);
+    icdev_data_available = true;
+    wake_up_interruptible(&icdev_waitq);
   }
   write_unlock(&event_rwlock);
-
   return (irq_handler_t) IRQ_HANDLED;
 }
 
