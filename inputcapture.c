@@ -13,6 +13,7 @@
 #include <linux/device.h>
 #include <linux/interrupt.h>
 #include <linux/gpio.h>
+#include <linux/poll.h>
 #ifndef ARM_CPU /*if is not running on ARM CPU then is ok to use get_cycles*/
 #include <linux/timex.h>
 #else
@@ -46,13 +47,18 @@
 
 
 #define _IOCTL_MAGIC 'K'
-#define IOCICDEVGPIORP _IOW(_IOCTL_MAGIC,1,u16) /* register pin */
-#define IOCICDEVGPIOUP _IOW(_IOCTL_MAGIC,2,u16) /* unregister ping */
-#define IOCICDEVGPIOEN _IO(_IOCTL_MAGIC,3)       /* start */
-#define IOCICDEVGPIODS _IO(_IOCTL_MAGIC,4)       /* stop  */
+#define IOCICUP _IOW(_IOCTL_MAGIC,1,u16) /* register pin */
+#define IOCICDW _IOW(_IOCTL_MAGIC,2,u16) /* unregister ping */
+#define IOCICFE _IO(_IOCTL_MAGIC,3) /*Capture timer value on every falling edge*/
+#define IOCICRE _IO(_IOCTL_MAGIC,4) /*Capture timer value on every rising edge*/
+#define IOCICRF _IO(_IOCTL_MAGIC,5) /*Capture timer value on rising and falling*/
 
-#define EVENT_NONE 0x00u
-#define EVENT_DONE 0x01u
+
+#define ICDEV_DETECT_RISING_EDGES 0x01u
+#define ICDEV_DETECT_FALLING_EDGES 0x02u
+#define ICDEV_DETECT_BOTH_EDGES 0x03u
+
+
 
 struct ic_device {
   struct cdev cdev;
@@ -67,17 +73,20 @@ static struct ic_device *icdev_Ptr=NULL;
 static dev_t icdev_no;
 static struct class *icdev_class_Ptr=NULL;
 static u16 ioctl_read_value;
+static u8 icdev_detect_level=0x00u;
 
-volatile bool start_measuring=false;
-volatile int icdev_irq_no=-1;
 volatile u64 icdev_value_ev=0x00ull;
-volatile u8 read_event_rising=EVENT_NONE;
-volatile u8 read_event_falling=EVENT_NONE;
+volatile int icdev_irq_no=-1;
+
+
+
+
 
 
 static int icdev_open(struct inode *, struct file *);
 static int icdev_release(struct inode *, struct file *);
 static ssize_t icdev_read(struct file *, char __user *, size_t, loff_t *);
+static unsigned int icdev_poll(struct file *, poll_table *);
 static long icdev_ioctl(struct file *, unsigned int, unsigned long);
 static irq_handler_t icdev_irq_handler(int, void *, struct pt_regs *);
 static void tasklet_handler(unsigned long data);
@@ -85,13 +94,14 @@ static void tasklet_handler(unsigned long data);
 
 static DEFINE_RWLOCK(event_rwlock);
 static DECLARE_TASKLET_DISABLED(irq_tasklet_worker,tasklet_handler,0);
-
+static DECLARE_WAIT_QUEUE_HEAD(icdev_waitq);
 				
 struct file_operations fops=
   {
     .open=icdev_open,
     .release=icdev_release,
     .read=icdev_read,
+    .poll=icdev_poll,
     .unlocked_ioctl=icdev_ioctl
   };
 
@@ -108,8 +118,6 @@ static int icdev_open(struct inode *inode, struct file *file)
     mutex_unlock(&icdev_Ptr->io_mutex);
     return -EBUSY;
   }
-  read_event_rising=EVENT_NONE;
-  read_event_falling=EVENT_NONE;
   icdev_Ptr->is_open = 1;
   tasklet_enable(&irq_tasklet_worker);
   mutex_unlock(&icdev_Ptr->io_mutex);
@@ -145,6 +153,19 @@ static ssize_t icdev_read(struct file *filp, char __user *buffer, size_t length,
   return sizeof(u64);
 }
 
+static unsigned int icdev_poll(struct file *file, poll_table *wait)
+{
+  //icdev_waitq
+  unsigned int reval_mask=0x00u;
+  poll_wait(file,&icdev_waitq,wait);
+  read_lock(&event_rwlock);
+  if (icdev_value_ev == 0ull) {
+    reval_mask|=(POLLIN | POLLRDNORM);
+  }
+  read_unlock(&event_rwlock);
+  return reval_mask;
+}
+
 static long icdev_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioctl_param)
 {
   u16 __user *ioctl_value_Ptr;
@@ -157,8 +178,8 @@ static long icdev_ioctl(struct file *file, unsigned int ioctl_num, unsigned long
   }
 
   switch(ioctl_num){
-  case IOCICDEVGPIORP:/* register pin */
-    pr_err("\tIOCICDEVGPIORP:Gpio Pin %d",ioctl_read_value);
+  case IOCICUP:/* register pin */
+    pr_err("\tIOCICUP:Gpio Pin %d",ioctl_read_value);
     if (gpio_is_valid(ioctl_read_value)) {
       gpio_request(ioctl_read_value,"sysfs");/*TODO: Check if error -> !=0*/
       gpio_direction_input(ioctl_read_value);
@@ -176,20 +197,22 @@ static long icdev_ioctl(struct file *file, unsigned int ioctl_num, unsigned long
     } else {
       // TODO: Set Error code
     }
-    
     break;
-  case IOCICDEVGPIOUP:/* unregister pin */
+  case IOCICDW:/* unregister pin */
     if (icdev_irq_no != -1) {
       free_irq(icdev_irq_no, NULL);
     }
     gpio_unexport(ioctl_read_value);
     gpio_free(ioctl_read_value);
     break;
-  case IOCICDEVGPIOEN:/* start */
-    start_measuring = true;
+  case IOCICFE: /*Capture timer value on every falling edge*/
+    icdev_detect_level=ICDEV_DETECT_FALLING_EDGES;
     break;
-  case IOCICDEVGPIODS:/*stop measuring*/
-    start_measuring = false;
+  case IOCICRE: /*Capture timer value on every rising edge*/
+    icdev_detect_level=ICDEV_DETECT_RISING_EDGES;
+    break;
+  case IOCICRF:
+    icdev_detect_level=ICDEV_DETECT_BOTH_EDGES;
     break;
   default:
     break;
@@ -200,37 +223,36 @@ static long icdev_ioctl(struct file *file, unsigned int ioctl_num, unsigned long
 
 static void tasklet_handler(unsigned long data)
 {
-  #ifdef ARM_CPU
+
+
+#ifdef ARM_CPU
   struct timespec64 t;
 #endif
   int value = 0x00;
   write_lock(&event_rwlock);
-  if ( !read_event_rising || !read_event_falling){
-    value = gpio_get_value(ioctl_read_value);
-    pr_err("\tInterrupt:Read Value %d", value);
-    if (value > 0 && !read_event_rising ) {
+  icdev_value_ev=0x00ull;
+  value = gpio_get_value(ioctl_read_value);
+  pr_devel("\tInterrupt:Read Value %d", value);
+
 #ifndef ARM_CPU
-      icdev_value_ev = get_cycles(); /* get_cycles return clock counter value except for arm and 486*/
+  icdev_value_ev = get_cycles(); /* get_cycles return clock counter value except for arm and 486*/
 #else
-      ktime_get_real_ts64(&t); /*alias getnstimeofday is deprecated for new code*/
-      icdev_value_ev=t.tv_sec*1000000000ull+t.tv_nsec;/*transform everything to nsec*/
+  ktime_get_real_ts64(&t); /*alias getnstimeofday is deprecated for new code*/
+  icdev_value_ev=t.tv_sec*1000000000ull+t.tv_nsec;/*transform everything to nsec*/
 #endif
-      pr_err("\tInterrupt:Get Cycles Rising %llu", icdev_value_ev);
-      read_event_rising = EVENT_DONE;
-    } else if ( value <1 && !read_event_falling) {
-#ifndef ARM_CPU
-      icdev_value_ev = get_cycles()-icdev_value_ev; 
-#else
-      ktime_get_real_ts64(&t);
-      icdev_value_ev = t.tv_sec*1000000000ull+t.tv_nsec-icdev_value_ev; 
-#endif
-      pr_err("\tInterrupt:Get Cycles Falling %llu", icdev_value_ev);
-      read_event_falling = EVENT_DONE;
-    }
-    
+  
+  if (value>0 && icdev_detect_level != ICDEV_DETECT_FALLING_EDGES) {
+    pr_devel("Value greated than 0, timer value %llu",icdev_value_ev);
+    wake_up_interruptible(&icdev_waitq);
+  }
+
+  if (value<1 && icdev_detect_level != ICDEV_DETECT_RISING_EDGES){
+    pr_devel("Value greated than 0, timer value %llu",icdev_value_ev);
+    wake_up_interruptible(&icdev_waitq);
   }
   write_unlock(&event_rwlock);
-
+  
+  
 }
 
 
