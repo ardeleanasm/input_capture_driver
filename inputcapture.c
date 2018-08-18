@@ -67,8 +67,6 @@ struct ic_device {
   u8 is_open;
 };
 
-
-
 static struct ic_device *icdev_Ptr=NULL;
 static dev_t icdev_no;
 static struct class *icdev_class_Ptr=NULL;
@@ -77,11 +75,6 @@ static u8 icdev_detect_level=0x00u;
 
 volatile u64 icdev_value_ev=0x00ull;
 volatile int icdev_irq_no=-1;
-volatile bool icdev_data_available=false;
-
-
-
-
 
 static int icdev_open(struct inode *, struct file *);
 static int icdev_release(struct inode *, struct file *);
@@ -115,7 +108,6 @@ static int icdev_open(struct inode *inode, struct file *file)
     mutex_unlock(&icdev_Ptr->io_mutex);
     return -EBUSY;
   }
-  icdev_data_available = false;
   icdev_Ptr->is_open = 1;
   mutex_unlock(&icdev_Ptr->io_mutex);
   
@@ -129,7 +121,6 @@ static int icdev_release(struct inode *inode, struct file *file)
   if (!mutex_is_locked(&icdev_Ptr->io_mutex))
     mutex_lock(&icdev_Ptr->io_mutex);
   icdev_Ptr->is_open=0;
-  icdev_data_available = false;
   mutex_unlock(&icdev_Ptr->io_mutex);
   
   return 0;
@@ -159,14 +150,10 @@ static unsigned int icdev_poll(struct file *file, poll_table *wait)
   unsigned int reval_mask=0x00u;
   poll_wait(file,&icdev_waitq,wait);
   read_lock_irqsave(&event_rwlock,flags);
-  if (icdev_data_available == true) {
+  if (icdev_value_ev != 0) {
     reval_mask|=(POLLIN | POLLRDNORM);
   }
   read_unlock_irqrestore(&event_rwlock,flags);
-  /*reset flag*/
-  write_lock_irqsave(&event_rwlock,flags);
-  icdev_data_available = false;
-  write_unlock_irqrestore(&event_rwlock,flags);
   return reval_mask;
 }
 
@@ -231,11 +218,12 @@ static irq_handler_t icdev_irq_handler(int irq, void *dev_id)
   struct timespec64 t;
 #endif
   int value = 0x00;
-  write_lock(&event_rwlock);
-  icdev_value_ev=0x00ull;
   value = gpio_get_value(ioctl_read_value);
   pr_err("\tInterrupt:Read Value %d", value);
 
+  write_lock(&event_rwlock);
+  icdev_value_ev=0x00ull;
+  
 #ifndef ARM_CPU
   icdev_value_ev = get_cycles(); /* get_cycles return clock counter value except for arm and 486*/
 #else
@@ -245,14 +233,12 @@ static irq_handler_t icdev_irq_handler(int irq, void *dev_id)
   
   if (value>0 && icdev_detect_level != ICDEV_DETECT_FALLING_EDGES) {
     pr_devel("Value greated than 0, timer value %llu",icdev_value_ev);
-    icdev_data_available = true;
     wake_up_interruptible(&icdev_waitq);
-  }
-
-  if (value<1 && icdev_detect_level != ICDEV_DETECT_RISING_EDGES){
+  } else if (value<1 && icdev_detect_level != ICDEV_DETECT_RISING_EDGES){
     pr_devel("Value greated than 0, timer value %llu",icdev_value_ev);
-    icdev_data_available = true;
     wake_up_interruptible(&icdev_waitq);
+  } else {
+    icdev_detect_level=0x00ull;
   }
   write_unlock(&event_rwlock);
   return (irq_handler_t) IRQ_HANDLED;
