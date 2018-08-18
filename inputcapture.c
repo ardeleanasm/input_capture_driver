@@ -150,6 +150,8 @@ static ssize_t icdev_read(struct file *filp, char __user *buffer, size_t length,
   if (copy_to_user(buffer,&buffer_value,sizeof(u64)) != 0) {
     return -EINVAL;
   }
+  if (buffer_value == 0)
+    return 0;
   return sizeof(u64);
 }
 
