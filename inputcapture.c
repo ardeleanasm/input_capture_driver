@@ -89,8 +89,6 @@ static ssize_t icdev_read(struct file *, char __user *, size_t, loff_t *);
 static unsigned int icdev_poll(struct file *, poll_table *);
 static long icdev_ioctl(struct file *, unsigned int, unsigned long);
 static irq_handler_t icdev_irq_handler(int, void *, struct pt_regs *);
-static void tasklet_handler(unsigned long data);
-
 
 static DEFINE_RWLOCK(event_rwlock);
 static DECLARE_WAIT_QUEUE_HEAD(icdev_waitq);
