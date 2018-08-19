@@ -54,10 +54,6 @@
 #define IOCICRF _IO(_IOCTL_MAGIC,5) /*Capture timer value on rising and falling*/
 
 
-#define ICDEV_DETECT_RISING_EDGES 0x01u
-#define ICDEV_DETECT_FALLING_EDGES 0x02u
-#define ICDEV_DETECT_BOTH_EDGES 0x03u
-
 
 
 struct ic_device {
@@ -67,14 +63,15 @@ struct ic_device {
   u8 is_open;
 };
 
-static struct ic_device *icdev_Ptr=NULL;
+static struct ic_device *icdev_Ptr = NULL;
 static dev_t icdev_no;
-static struct class *icdev_class_Ptr=NULL;
-static u16 ioctl_read_value;
-static u8 icdev_detect_level=0x00u;
+static struct class *icdev_class_Ptr = NULL;
+static u16 ioctl_read_value = 0x00u;
+static u32 icdev_detect_level = IRQF_TRIGGER_NONE;
 
-volatile u64 icdev_value_ev=0x00ull;
-volatile int icdev_irq_no=-1;
+volatile u64 icdev_value_ev = 0x00ull;
+volatile bool icdev_updated_read = false;
+volatile int icdev_irq_no = -1;
 
 static int icdev_open(struct inode *, struct file *);
 static int icdev_release(struct inode *, struct file *);
@@ -83,7 +80,7 @@ static unsigned int icdev_poll(struct file *, poll_table *);
 static long icdev_ioctl(struct file *, unsigned int, unsigned long);
 static irq_handler_t icdev_irq_handler(int, void *);
 
-static DEFINE_RWLOCK(event_rwlock);
+static DEFINE_SPINLOCK(event_rwlock);
 static DECLARE_WAIT_QUEUE_HEAD(icdev_waitq);
 				
 struct file_operations fops=
@@ -132,9 +129,9 @@ static ssize_t icdev_read(struct file *filp, char __user *buffer, size_t length,
   unsigned long flags;
   u64 buffer_value=0x00ull;
 
-  read_lock_irqsave(&event_rwlock, flags);
+  spin_lock_irqsave(&event_rwlock, flags);
   buffer_value=icdev_value_ev;
-  read_unlock_irqrestore(&event_rwlock, flags);
+  spin_unlock_irqrestore(&event_rwlock, flags);
 
   if (copy_to_user(buffer,&buffer_value,sizeof(u64)) != 0) {
     return -EINVAL;
@@ -149,11 +146,12 @@ static unsigned int icdev_poll(struct file *file, poll_table *wait)
   unsigned long flags;
   unsigned int reval_mask=0x00u;
   poll_wait(file,&icdev_waitq,wait);
-  read_lock_irqsave(&event_rwlock,flags);
-  if (icdev_value_ev != 0) {
+  spin_lock_irqsave(&event_rwlock,flags);
+  if (icdev_updated_read != false ) {
     reval_mask|=(POLLIN | POLLRDNORM);
   }
-  read_unlock_irqrestore(&event_rwlock,flags);
+  icdev_updated_read = false;
+  spin_unlock_irqrestore(&event_rwlock,flags);
   return reval_mask;
 }
 
@@ -177,7 +175,7 @@ static long icdev_ioctl(struct file *file, unsigned int ioctl_num, unsigned long
       gpio_export(ioctl_read_value,false);
       /*request interrupt*/
       icdev_irq_no=gpio_to_irq(ioctl_read_value);
-      if (request_irq(icdev_irq_no,(irq_handler_t)icdev_irq_handler, IRQF_TRIGGER_RISING|IRQF_TRIGGER_FALLING,
+      if (request_irq(icdev_irq_no,(irq_handler_t)icdev_irq_handler,icdev_detect_level,
 		      DEVICE_NAME, NULL)){
 	icdev_irq_no=-1;
 	pr_err("Request irq error");
@@ -190,17 +188,18 @@ static long icdev_ioctl(struct file *file, unsigned int ioctl_num, unsigned long
     if (icdev_irq_no != -1) {
       free_irq(icdev_irq_no, NULL);
     }
+    icdev_detect_level=IRQF_TRIGGER_NONE;
     gpio_unexport(ioctl_read_value);
     gpio_free(ioctl_read_value);
     break;
   case IOCICFE: /*Capture timer value on every falling edge*/
-    icdev_detect_level=ICDEV_DETECT_FALLING_EDGES;
+    icdev_detect_level = IRQF_TRIGGER_FALLING;
     break;
   case IOCICRE: /*Capture timer value on every rising edge*/
-    icdev_detect_level=ICDEV_DETECT_RISING_EDGES;
+    icdev_detect_level = IRQF_TRIGGER_RISING;
     break;
   case IOCICRF:
-    icdev_detect_level=ICDEV_DETECT_BOTH_EDGES;
+    icdev_detect_level = IRQF_TRIGGER_RISING|IRQF_TRIGGER_FALLING;
     break;
   default:
     break;
@@ -221,7 +220,7 @@ static irq_handler_t icdev_irq_handler(int irq, void *dev_id)
   value = gpio_get_value(ioctl_read_value);
   pr_err("\tInterrupt:Read Value %d", value);
 
-  write_lock(&event_rwlock);
+  spin_lock(&event_rwlock);
   icdev_value_ev=0x00ull;
   
 #ifndef ARM_CPU
@@ -230,17 +229,10 @@ static irq_handler_t icdev_irq_handler(int irq, void *dev_id)
   ktime_get_real_ts64(&t); /*alias getnstimeofday is deprecated for new code*/
   icdev_value_ev=t.tv_sec*1000000000ull+t.tv_nsec;/*transform everything to nsec*/
 #endif
-  
-  if (value == 1 && icdev_detect_level != ICDEV_DETECT_FALLING_EDGES) {
-    pr_devel("Value greated than 0, timer value %llu",icdev_value_ev);
-    wake_up_interruptible(&icdev_waitq);
-  } else if (value == 0 && icdev_detect_level != ICDEV_DETECT_RISING_EDGES){
-    pr_devel("Value greated than 0, timer value %llu",icdev_value_ev);
-    wake_up_interruptible(&icdev_waitq);
-  } else {
-    icdev_detect_level=0x00ull;
-  }
-  write_unlock(&event_rwlock);
+  pr_devel("Value read than 0, timer value %llu",icdev_value_ev);
+  wake_up_interruptible(&icdev_waitq);
+  icdev_updated_read = true;
+  spin_unlock(&event_rwlock);
   return (irq_handler_t) IRQ_HANDLED;
 }
 
