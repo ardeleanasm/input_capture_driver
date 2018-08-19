@@ -20,7 +20,7 @@
 #include <linux/ktime.h> /*make use of getnstimeofday()*/
 #endif
 
-#define DRIVER_AUTHOR "23ars <ardeleanasm@gmail.com>"
+#define DRIVER_AUTHOR "ardeleanasm <ardeleanasm@gmail.com>"
 #define DRIVER_DESC "Input Capture driver"
 #define DEVICE_NAME "ic"
 #define DEVICE_CLASS_NAME "ic_class"
@@ -52,6 +52,10 @@
 #define IOCICFE _IO(_IOCTL_MAGIC,3) /*Capture timer value on every falling edge*/
 #define IOCICRE _IO(_IOCTL_MAGIC,4) /*Capture timer value on every rising edge*/
 #define IOCICRF _IO(_IOCTL_MAGIC,5) /*Capture timer value on rising and falling*/
+
+#define ICEBIRQN 0x01
+#define ICEBGPIO 0x02
+
 
 struct icdev_data{
   u64 data;
@@ -106,18 +110,17 @@ struct file_operations fops=
 static int icdev_open(struct inode *inode, struct file *file)
 {
   if (mutex_trylock(&icdev_Ptr->io_mutex) == 0) {
-    printk(KERN_ERR "Device Busy!\n");
+    pr_err("Device Busy.");
     return -EBUSY;
   }
 
   if (icdev_Ptr->is_open == 1) {
-    printk(KERN_ERR "%s:Device already open!\n",DEVICE_NAME);
+    pr_err("%s:Device already open.",DEVICE_NAME);
     mutex_unlock(&icdev_Ptr->io_mutex);
     return -EBUSY;
   }
   icdev_Ptr->is_open = 1;
   mutex_unlock(&icdev_Ptr->io_mutex);
-  
   return 0;
 }
 
@@ -128,7 +131,6 @@ static int icdev_release(struct inode *inode, struct file *file)
     mutex_lock(&icdev_Ptr->io_mutex);
   icdev_Ptr->is_open = 0;
   mutex_unlock(&icdev_Ptr->io_mutex);
-  
   return 0;
 }
 
@@ -177,9 +179,9 @@ static long icdev_ioctl(struct file *file, unsigned int ioctl_num, unsigned long
 
   switch(ioctl_num){
   case IOCICUP:/* register pin */
-    pr_err("\tIOCICUP:Gpio Pin %d",ioctl_read_value);
+    pr_notice("Registering Gpio Pin %d.",ioctl_read_value);
     if (gpio_is_valid(ioctl_read_value)) {
-      gpio_request(ioctl_read_value,"sysfs");/*TODO: Check if error -> !=0*/
+      gpio_request(ioctl_read_value,"sysfs");
       gpio_direction_input(ioctl_read_value);
       gpio_export(ioctl_read_value,false);
       /*request interrupt*/
@@ -187,10 +189,12 @@ static long icdev_ioctl(struct file *file, unsigned int ioctl_num, unsigned long
       if (request_irq(icdev_irq_no,(irq_handler_t)icdev_irq_handler,icdev_detect_level,
 		      DEVICE_NAME, NULL)){
 	icdev_irq_no = -1;
-	pr_err("Request irq error");
+	pr_err("Request interrupt error.");
+	error_code=ICEBIRQN;
       } 
     } else {
-      pr_err("INVALID GPIO");
+      error_code=ICEBGPIO;
+      pr_err("Invalid gpio %d.",ioctl_read_value);
     }
     break;
   case IOCICDW:/* unregister pin */
@@ -227,8 +231,6 @@ static irq_handler_t icdev_irq_handler(int irq, void *dev_id)
 #endif
   int value = 0x00;
   value = gpio_get_value(ioctl_read_value);
-  pr_err("\tInterrupt:Read Value %d", value);
-
   spin_lock(&event_rwlock);
 #ifndef ARM_CPU
   icdev_value.data = get_cycles(); /* get_cycles return clock counter value except for arm and 486*/
@@ -236,7 +238,6 @@ static irq_handler_t icdev_irq_handler(int irq, void *dev_id)
   ktime_get_real_ts64(&t); /*alias getnstimeofday is deprecated for new code*/
   icdev_value.data = t.tv_sec*1000000000ull + t.tv_nsec;/*transform everything to nsec*/
 #endif
-  pr_err("Value read than 0, timer value %llu",icdev_value.data);
   wake_up_interruptible(&icdev_waitq);
   icdev_value.is_data_updated = true;
   spin_unlock(&event_rwlock);
@@ -248,12 +249,12 @@ static s8 alloc_device(void)
 {
   icdev_Ptr = kmalloc(sizeof(*icdev_Ptr),GFP_KERNEL);
   if (icdev_Ptr == NULL) {
-    printk(KERN_WARNING "%s:Failed to alloc memory for ic_device\n",DEVICE_NAME);
+    pr_err("%s:Failed to alloc memory for ic_device.",DEVICE_NAME);
     return -1;
   }
   memset(icdev_Ptr,0,sizeof(struct ic_device));
   if (alloc_chrdev_region(&icdev_no,0,1,DEVICE_NAME) < 0) {
-    printk(KERN_WARNING "%s:Could not register\n",DEVICE_NAME);
+    pr_err("%s:Could not register.",DEVICE_NAME);
     icdev_free_device();
     return -1;
   }
@@ -265,7 +266,7 @@ static s8 init_class(void)
 {
   icdev_class_Ptr = class_create(THIS_MODULE,DEVICE_CLASS_NAME);
   if (IS_ERR(icdev_class_Ptr)) {
-    printk(KERN_WARNING "%s:Could not create class\n",DEVICE_NAME);
+    pr_err("%s:Could not create class.",DEVICE_NAME);
     icdev_unregister_region();
     icdev_free_device();
     return -1;
@@ -278,7 +279,7 @@ static s8 init_device_registration(void)
   cdev_init(&icdev_Ptr->cdev,&fops);
   icdev_Ptr->cdev.owner = THIS_MODULE;
   if (cdev_add(&(icdev_Ptr->cdev),icdev_no,1) != 0) {
-    printk(KERN_WARNING "%s:Could not add device\n",DEVICE_NAME);
+    pr_err("%s:Could not add device.",DEVICE_NAME);
     icdev_destroy_class();
     icdev_unregister_region();
     icdev_free_device();
@@ -287,7 +288,7 @@ static s8 init_device_registration(void)
 
   icdev_Ptr->device_Ptr = device_create(icdev_class_Ptr,NULL,MKDEV(MAJOR(icdev_no),0),NULL,DEVICE_PROCESS,0);
   if (IS_ERR(icdev_Ptr->device_Ptr)) {
-    printk(KERN_WARNING "%s:Could not create device\n",DEVICE_NAME);
+    pr_err("%s:Could not create device.",DEVICE_NAME);
     icdev_destroy_device();
     icdev_destroy_class();
     icdev_unregister_region();
@@ -318,8 +319,8 @@ static int __init ic_init(void)
   
   
   mutex_init(&(icdev_Ptr->io_mutex));
-  printk(KERN_INFO "%s:Registered device with (%d,%d)\n",DEVICE_NAME,MAJOR(icdev_no),MINOR(icdev_no));
-  printk(KERN_INFO "Driver %s loaded. Version %2x %2x %2x",DEVICE_NAME,
+  pr_info("%s:Registered device with (%d,%d)\n",DEVICE_NAME,MAJOR(icdev_no),MINOR(icdev_no));
+  pr_info("Driver %s loaded. Version %2x %2x %2x",DEVICE_NAME,
 	 VERSION_MAJOR_NUMBER,VERSION_MINOR_NUMBER,VERSION_PATCH_NUMBER);
   return 0;
   
@@ -331,7 +332,7 @@ static int __init ic_init(void)
 
 static void __exit ic_exit(void)
 {
-  printk(KERN_INFO "%s:Unregister...:(",DEVICE_NAME);
+  pr_info("%s:Unregister...:(",DEVICE_NAME);
 
   if (icdev_class_Ptr != NULL) {
     icdev_destroy_device();
@@ -344,7 +345,7 @@ static void __exit ic_exit(void)
     icdev_free_device();
   }
 
-  printk(KERN_INFO "Driver %s unloaded.",DEVICE_NAME);
+  pr_info("Driver %s unloaded.",DEVICE_NAME);
  
 }
 
