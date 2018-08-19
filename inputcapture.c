@@ -90,7 +90,7 @@ static unsigned int icdev_poll(struct file *, poll_table *);
 static long icdev_ioctl(struct file *, unsigned int, unsigned long);
 static irq_handler_t icdev_irq_handler(int, void *);
 
-static DEFINE_RWLOCK(event_rwlock);
+static DEFINE_SPINLOCK(event_rwlock);
 static DECLARE_WAIT_QUEUE_HEAD(icdev_waitq);
 				
 struct file_operations fops=
@@ -138,9 +138,9 @@ static ssize_t icdev_read(struct file *filp, char __user *buffer, size_t length,
   unsigned long flags;
   u64 buffer_value = 0x00ull;
 
-  read_lock_irqsave(&event_rwlock, flags);
+  spin_lock_irqsave(&event_rwlock, flags);
   buffer_value = icdev_value.data;
-  read_unlock_irqrestore(&event_rwlock, flags);
+  spin_unlock_irqrestore(&event_rwlock, flags);
 
   if (copy_to_user(buffer,&buffer_value,sizeof(u64)) != 0) {
     return -EINVAL;
@@ -155,14 +155,12 @@ static unsigned int icdev_poll(struct file *file, poll_table *wait)
   unsigned long flags;
   unsigned int reval_mask = 0x00u;
   poll_wait(file,&icdev_waitq,wait);
-  read_lock_irqsave(&event_rwlock,flags);
+  spin_lock_irqsave(&event_rwlock,flags);
   if (icdev_value.is_data_updated != false ) {
     reval_mask |= (POLLIN | POLLRDNORM);
   }
-  read_unlock_irqrestore(&event_rwlock,flags);
-  write_lock_irqsave(&event_rwlock,flags);
   icdev_value.is_data_updated = false;
-  write_unlock_irqrestore(&event_rwlock,flags);
+  spin_unlock_irqrestore(&event_rwlock,flags);
   return reval_mask;
 }
 
@@ -231,17 +229,17 @@ static irq_handler_t icdev_irq_handler(int irq, void *dev_id)
   value = gpio_get_value(ioctl_read_value);
   pr_err("\tInterrupt:Read Value %d", value);
 
-  write_lock(&event_rwlock);
+  spin_lock(&event_rwlock);
 #ifndef ARM_CPU
   icdev_value.data = get_cycles(); /* get_cycles return clock counter value except for arm and 486*/
 #else
   ktime_get_real_ts64(&t); /*alias getnstimeofday is deprecated for new code*/
   icdev_value.data = t.tv_sec*1000000000ull + t.tv_nsec;/*transform everything to nsec*/
 #endif
-  pr_devel("Value read than 0, timer value %llu",icdev_value.data);
+  pr_err("Value read than 0, timer value %llu",icdev_value.data);
   wake_up_interruptible(&icdev_waitq);
-  icdev_value.is_data_updated = false;
-  write_unlock(&event_rwlock);
+  icdev_value.is_data_updated = true;
+  spin_unlock(&event_rwlock);
   return (irq_handler_t) IRQ_HANDLED;
 }
 
