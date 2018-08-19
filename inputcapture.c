@@ -53,7 +53,10 @@
 #define IOCICRE _IO(_IOCTL_MAGIC,4) /*Capture timer value on every rising edge*/
 #define IOCICRF _IO(_IOCTL_MAGIC,5) /*Capture timer value on rising and falling*/
 
-
+struct icdev_data{
+  u64 data;
+  bool is_data_updated;
+};
 
 
 struct ic_device {
@@ -69,8 +72,15 @@ static struct class *icdev_class_Ptr = NULL;
 static u16 ioctl_read_value = 0x00u;
 static u32 icdev_detect_level = IRQF_TRIGGER_NONE;
 
-volatile u64 icdev_value_ev = 0x00ull;
-volatile bool icdev_updated_read = false;
+static struct icdev_data icdev_value=
+  {
+    .data = 0x00ull,
+    .is_data_updated = false
+  };
+
+
+
+
 volatile int icdev_irq_no = -1;
 
 static int icdev_open(struct inode *, struct file *);
@@ -85,11 +95,11 @@ static DECLARE_WAIT_QUEUE_HEAD(icdev_waitq);
 				
 struct file_operations fops=
   {
-    .open=icdev_open,
-    .release=icdev_release,
-    .read=icdev_read,
-    .poll=icdev_poll,
-    .unlocked_ioctl=icdev_ioctl
+    .open = icdev_open,
+    .release = icdev_release,
+    .read = icdev_read,
+    .poll = icdev_poll,
+    .unlocked_ioctl = icdev_ioctl
   };
 
 
@@ -108,7 +118,6 @@ static int icdev_open(struct inode *inode, struct file *file)
   icdev_Ptr->is_open = 1;
   mutex_unlock(&icdev_Ptr->io_mutex);
   
-  
   return 0;
 }
 
@@ -117,7 +126,7 @@ static int icdev_release(struct inode *inode, struct file *file)
 {
   if (!mutex_is_locked(&icdev_Ptr->io_mutex))
     mutex_lock(&icdev_Ptr->io_mutex);
-  icdev_Ptr->is_open=0;
+  icdev_Ptr->is_open = 0;
   mutex_unlock(&icdev_Ptr->io_mutex);
   
   return 0;
@@ -127,16 +136,16 @@ static ssize_t icdev_read(struct file *filp, char __user *buffer, size_t length,
 {
   
   unsigned long flags;
-  u64 buffer_value=0x00ull;
+  u64 buffer_value = 0x00ull;
 
   spin_lock_irqsave(&event_rwlock, flags);
-  buffer_value=icdev_value_ev;
+  buffer_value = icdev_value.data;
   spin_unlock_irqrestore(&event_rwlock, flags);
 
   if (copy_to_user(buffer,&buffer_value,sizeof(u64)) != 0) {
     return -EINVAL;
   }
-  if (buffer_value == 0)
+  if (buffer_value == 0ull)
     return 0;
   return sizeof(u64);
 }
@@ -144,13 +153,13 @@ static ssize_t icdev_read(struct file *filp, char __user *buffer, size_t length,
 static unsigned int icdev_poll(struct file *file, poll_table *wait)
 {
   unsigned long flags;
-  unsigned int reval_mask=0x00u;
+  unsigned int reval_mask = 0x00u;
   poll_wait(file,&icdev_waitq,wait);
   spin_lock_irqsave(&event_rwlock,flags);
-  if (icdev_updated_read != false ) {
-    reval_mask|=(POLLIN | POLLRDNORM);
+  if (icdev_value.is_data_updated != false ) {
+    reval_mask |= (POLLIN | POLLRDNORM);
   }
-  icdev_updated_read = false;
+  icdev_value.is_data_updated = false;
   spin_unlock_irqrestore(&event_rwlock,flags);
   return reval_mask;
 }
@@ -158,8 +167,8 @@ static unsigned int icdev_poll(struct file *file, poll_table *wait)
 static long icdev_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioctl_param)
 {
   u16 __user *ioctl_value_Ptr;
-  long error_code=0x00L;
-  ioctl_read_value=0x00ul;
+  long error_code = 0x00L;
+  ioctl_read_value = 0x00ul;
 
   ioctl_value_Ptr = (u16 __user *)ioctl_param;
   if (copy_from_user(&ioctl_read_value,ioctl_value_Ptr,sizeof(u16)) != 0) {
@@ -174,10 +183,10 @@ static long icdev_ioctl(struct file *file, unsigned int ioctl_num, unsigned long
       gpio_direction_input(ioctl_read_value);
       gpio_export(ioctl_read_value,false);
       /*request interrupt*/
-      icdev_irq_no=gpio_to_irq(ioctl_read_value);
+      icdev_irq_no = gpio_to_irq(ioctl_read_value);
       if (request_irq(icdev_irq_no,(irq_handler_t)icdev_irq_handler,icdev_detect_level,
 		      DEVICE_NAME, NULL)){
-	icdev_irq_no=-1;
+	icdev_irq_no = -1;
 	pr_err("Request irq error");
       } 
     } else {
@@ -188,7 +197,7 @@ static long icdev_ioctl(struct file *file, unsigned int ioctl_num, unsigned long
     if (icdev_irq_no != -1) {
       free_irq(icdev_irq_no, NULL);
     }
-    icdev_detect_level=IRQF_TRIGGER_NONE;
+    icdev_detect_level = IRQF_TRIGGER_NONE;
     gpio_unexport(ioctl_read_value);
     gpio_free(ioctl_read_value);
     break;
@@ -199,7 +208,7 @@ static long icdev_ioctl(struct file *file, unsigned int ioctl_num, unsigned long
     icdev_detect_level = IRQF_TRIGGER_RISING;
     break;
   case IOCICRF:
-    icdev_detect_level = IRQF_TRIGGER_RISING|IRQF_TRIGGER_FALLING;
+    icdev_detect_level = IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING;
     break;
   default:
     break;
@@ -221,28 +230,23 @@ static irq_handler_t icdev_irq_handler(int irq, void *dev_id)
   pr_err("\tInterrupt:Read Value %d", value);
 
   spin_lock(&event_rwlock);
-  icdev_value_ev=0x00ull;
-  
 #ifndef ARM_CPU
-  icdev_value_ev = get_cycles(); /* get_cycles return clock counter value except for arm and 486*/
+  icdev_value.data = get_cycles(); /* get_cycles return clock counter value except for arm and 486*/
 #else
   ktime_get_real_ts64(&t); /*alias getnstimeofday is deprecated for new code*/
-  icdev_value_ev=t.tv_sec*1000000000ull+t.tv_nsec;/*transform everything to nsec*/
+  icdev_value.data = t.tv_sec*1000000000ull + t.tv_nsec;/*transform everything to nsec*/
 #endif
-  pr_devel("Value read than 0, timer value %llu",icdev_value_ev);
+  pr_devel("Value read than 0, timer value %llu",icdev_value.data);
   wake_up_interruptible(&icdev_waitq);
-  icdev_updated_read = true;
+  icdev_value.is_data_updated = false;
   spin_unlock(&event_rwlock);
   return (irq_handler_t) IRQ_HANDLED;
 }
 
 
-
-
-
 static s8 alloc_device(void)
 {
-  icdev_Ptr=kmalloc(sizeof(*icdev_Ptr),GFP_KERNEL);
+  icdev_Ptr = kmalloc(sizeof(*icdev_Ptr),GFP_KERNEL);
   if (icdev_Ptr == NULL) {
     printk(KERN_WARNING "%s:Failed to alloc memory for ic_device\n",DEVICE_NAME);
     return -1;
@@ -259,7 +263,7 @@ static s8 alloc_device(void)
 
 static s8 init_class(void)
 {
-  icdev_class_Ptr=class_create(THIS_MODULE,DEVICE_CLASS_NAME);
+  icdev_class_Ptr = class_create(THIS_MODULE,DEVICE_CLASS_NAME);
   if (IS_ERR(icdev_class_Ptr)) {
     printk(KERN_WARNING "%s:Could not create class\n",DEVICE_NAME);
     icdev_unregister_region();
@@ -300,19 +304,19 @@ static s8 init_device_registration(void)
 static int __init ic_init(void)
 {
   s8 init_error = 0;
-  init_error=alloc_device();
+  init_error = alloc_device();
   if (init_error == -1)
     goto ic_init_error;
-
+  
   init_error = init_class();
   if (init_error == -1)
     goto ic_init_error;
- 
+  
   init_error = init_device_registration();
   if (init_error == -1)
     goto ic_init_error;
-
- 
+  
+  
   mutex_init(&(icdev_Ptr->io_mutex));
   printk(KERN_INFO "%s:Registered device with (%d,%d)\n",DEVICE_NAME,MAJOR(icdev_no),MINOR(icdev_no));
   printk(KERN_INFO "Driver %s loaded. Version %2x %2x %2x",DEVICE_NAME,
@@ -320,7 +324,7 @@ static int __init ic_init(void)
   return 0;
   
   
-  ic_init_error:
+ ic_init_error:
   return -EBUSY;
   
 }
